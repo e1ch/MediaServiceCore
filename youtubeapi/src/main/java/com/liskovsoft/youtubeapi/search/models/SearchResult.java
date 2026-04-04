@@ -18,9 +18,12 @@ public class SearchResult {
     //private String mNextPageKey;
 
     /**
-     * Search result with multiple rows
+     * Search result with multiple rows.
+     * TV client: $.contents.sectionListRenderer.contents[*]
+     * WEB client: $.contents.twoColumnSearchResultsRenderer.primaryContents.sectionListRenderer.contents[*]
      */
-    @JsonPath("$.contents.sectionListRenderer.contents[*]")
+    @JsonPath({"$.contents.sectionListRenderer.contents[*]",
+               "$.contents.twoColumnSearchResultsRenderer.primaryContents.sectionListRenderer.contents[*]"})
     private List<SearchSection> mSections;
 
     /**

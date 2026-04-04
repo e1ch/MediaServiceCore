@@ -9,7 +9,8 @@ public class ItemWrapper {
 
     @JsonPath({"$.gridVideoRenderer",
                "$.pivotVideoRenderer", // suggested item
-               "$.compactVideoRenderer"}) // history/search result item
+               "$.compactVideoRenderer", // history/search result item (TV client)
+               "$.videoRenderer"}) // search result item (WEB client)
     private VideoItem mVideoItem;
 
     @JsonPath("$.tvMusicVideoRenderer")

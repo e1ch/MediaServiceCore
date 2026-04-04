@@ -13,9 +13,13 @@ import com.liskovsoft.youtubeapi.common.models.impl.mediaitem.ShortsMediaItem
 import com.liskovsoft.youtubeapi.next.v2.gen.getItems
 import com.liskovsoft.youtubeapi.next.v2.gen.getContinuationToken
 import com.liskovsoft.youtubeapi.next.v2.gen.getShelves
+import com.liskovsoft.youtubeapi.search.SearchApi
+import com.liskovsoft.youtubeapi.search.SearchApiHelper
+import com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup
 
 internal open class BrowseService2 {
     private val mBrowseApi = RetrofitHelper.create(BrowseApi::class.java)
+    private val mSearchApi = RetrofitHelper.create(SearchApi::class.java)
 
     //fun getHome(): List<MediaGroup?>? {
     //    val home = getBrowseRows(BrowseApiHelper.getHomeQueryWeb(), MediaGroup.TYPE_HOME)
@@ -23,18 +27,84 @@ internal open class BrowseService2 {
     //}
 
     fun getHome(): Pair<List<MediaGroup?>?, String?>? {
-        //val rows = getBrowseRows(BrowseApiHelper.getHomeQueryWeb(), MediaGroup.TYPE_HOME)
-        //
-        //if (rows?.all { it?.isEmpty == true } != false) // in anonymous mode WEB home page is empty
-        //    return getBrowseRowsTV(BrowseApiHelper.getHomeQueryTV(), MediaGroup.TYPE_HOME)
-        //
-        //return Pair(rows, null)
+        // Try TV client first (works for signed-in users)
+        val tvResult = getBrowseRowsTV(BrowseApiHelper::getHomeQuery, MediaGroup.TYPE_HOME)
 
-        return getBrowseRowsTV(BrowseApiHelper::getHomeQuery, MediaGroup.TYPE_HOME)
+        // Check if TV result has real video content (not just login prompts/feedNudge).
+        // Only count items that have actual video IDs.
+        val hasRealVideos = tvResult?.first?.any { group ->
+            group?.mediaItems?.any { it?.videoId != null } == true
+        } == true
+
+        if (hasRealVideos) {
+            return tvResult
+        }
+
+        // Anonymous mode: TV/WEB home feeds return login prompts.
+        // Fall back to search-based content (like PrismTube).
+        val searchFallback = getSearchFallback(SEARCH_QUERIES_HOME, MediaGroup.TYPE_HOME)
+        if (searchFallback.isNotEmpty()) {
+            return Pair(searchFallback, null)
+        }
+
+        return tvResult
     }
 
     fun getTrending(): List<MediaGroup?>? {
-        return getBrowseRowsWeb(BrowseApiHelper.getTrendingQuery(AppClient.WEB), MediaGroup.TYPE_TRENDING)
+        // Try FEtrending first
+        val result = getBrowseRowsWeb(BrowseApiHelper.getTrendingQuery(AppClient.WEB), MediaGroup.TYPE_TRENDING)
+        val hasRealTrending = result?.any { group ->
+            group?.mediaItems?.any { it?.videoId != null } == true
+        } == true
+        if (hasRealTrending) {
+            return result
+        }
+
+        // FEtrending often returns 400. Fall back to search-based trending.
+        return getSearchFallback(SEARCH_QUERIES_TRENDING, MediaGroup.TYPE_TRENDING).ifEmpty { result }
+    }
+
+    /**
+     * Search-based fallback for when browse endpoints fail or return empty.
+     * Each query produces a named MediaGroup (shelf), similar to PrismTube's approach.
+     * Deduplicates videos by videoId across all query results.
+     */
+    fun getSearchFallback(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
+        val result = mutableListOf<MediaGroup?>()
+        val seenIds = mutableSetOf<String>()
+        for ((title, query) in queries) {
+            val searchResult = RetrofitHelper.get(
+                mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
+            )
+            searchResult?.let {
+                val groups = YouTubeMediaGroup.from(it, groupType)
+                groups?.firstOrNull()?.let { group ->
+                    // Override the title with our category name
+                    (group as? YouTubeMediaGroup)?.title = title
+                    // Deduplicate: remove videos already seen in previous queries
+                    group.mediaItems?.removeAll { item ->
+                        val id = item?.videoId
+                        if (id != null && !seenIds.add(id)) true else false
+                    }
+                    if (group.isEmpty != true) result.add(group)
+                }
+            }
+        }
+        return result
+    }
+
+    companion object {
+        // Default English fallback queries. Callers should pass localized queries when possible.
+        @JvmField val SEARCH_QUERIES_HOME = listOf(
+            "Trending" to "trending videos",
+            "Popular" to "most popular videos today",
+            "Recommended" to "recommended videos"
+        )
+        @JvmField val SEARCH_QUERIES_TRENDING = listOf(
+            "Trending Now" to "trending videos today",
+            "Viral" to "viral videos",
+            "Popular Creators" to "popular youtube creators"
+        )
     }
 
     fun getSports(): Pair<List<MediaGroup?>?, String?>? {

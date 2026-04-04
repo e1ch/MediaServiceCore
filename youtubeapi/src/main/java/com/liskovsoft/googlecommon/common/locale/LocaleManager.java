@@ -63,13 +63,24 @@ public class LocaleManager {
 
         if (VERSION.SDK_INT >= 21) {
             // Use BCP-47 code for language code to get content with correct language.
-            // For example, BCP-47 has zn-CN for simplified Chinese and zh-TW for traditional Chinese.
+            // For example, BCP-47 has zh-CN for simplified Chinese and zh-TW for traditional Chinese.
             mLang = locale.toLanguageTag();
         } else {
             mLang = locale.getLanguage();
         }
 
-        mCountry = locale.getCountry();
+        // Use explicit country preference if set, not the country embedded in locale.
+        // Fixes: language=zh_TW + country=JP → hl=zh-TW (Traditional Chinese), gl=JP (Japan content)
+        // Without this, gl would be "TW" because zh_TW locale has country=TW baked in.
+        String explicitCountry = getExplicitCountry();
+        mCountry = (explicitCountry != null && !explicitCountry.isEmpty()) ? explicitCountry : locale.getCountry();
+    }
+
+    private String getExplicitCountry() {
+        if (GlobalPreferences.isInitialized()) {
+            return GlobalPreferences.sInstance.getPreferredCountry();
+        }
+        return null;
     }
 
     private void initUtcOffset() {
