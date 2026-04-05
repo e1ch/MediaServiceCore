@@ -30,34 +30,33 @@ internal open class BrowseService2 {
 
     fun getHome(): Pair<List<MediaGroup?>?, String?>? {
         val t0 = System.currentTimeMillis()
-
-        // 1. Check prefetch cache FIRST (instant, from background prefetch)
         val result = mutableListOf<MediaGroup?>()
+
+        // 1. Prefetched content first (instant)
         if (prefetchedGroups.isNotEmpty()) {
             result.addAll(prefetchedGroups)
             prefetchedGroups.clear()
-            System.err.println("[PERF] getHome: used ${result.size} prefetched groups (instant)")
         }
 
-        // 2. Try TV client (works for signed-in users)
+        // 2. TV client (personalized recommendations for signed-in users)
         val t1 = System.currentTimeMillis()
         val tvResult = getBrowseRowsTV(BrowseApiHelper::getHomeQuery, MediaGroup.TYPE_HOME)
         System.err.println("[PERF] getHome: TV client took ${System.currentTimeMillis() - t1}ms")
 
-        val hasRealVideos = tvResult?.first?.any { group ->
+        val tvGroups = tvResult?.first?.filter { group ->
             group?.mediaItems?.any { it?.videoId != null } == true
-        } == true
-
-        if (hasRealVideos) {
-            System.err.println("[PERF] getHome: TV has content, total ${System.currentTimeMillis() - t0}ms")
-            return tvResult
         }
 
-        // 3. Anonymous mode: parallel search fallback
+        if (!tvGroups.isNullOrEmpty()) {
+            result.addAll(tvGroups)
+        }
+
+        // 3. ALWAYS add search-based results for variety (rotated queries each refresh)
         val t2 = System.currentTimeMillis()
-        val searchFallback = getSearchFallbackParallel(homeQueries, MediaGroup.TYPE_HOME)
-        System.err.println("[PERF] getHome: parallel search took ${System.currentTimeMillis() - t2}ms, got ${searchFallback.size} groups")
-        result.addAll(searchFallback)
+        val queries = getRotatedHomeQueries()
+        val searchResults = getSearchFallbackParallel(queries, MediaGroup.TYPE_HOME)
+        System.err.println("[PERF] getHome: search took ${System.currentTimeMillis() - t2}ms, got ${searchResults.size} groups")
+        result.addAll(searchResults)
 
         // Track shown videoIds
         result.forEach { group ->
@@ -66,8 +65,20 @@ internal open class BrowseService2 {
             }
         }
 
-        System.err.println("[PERF] getHome: TOTAL ${System.currentTimeMillis() - t0}ms")
+        System.err.println("[PERF] getHome: TOTAL ${System.currentTimeMillis() - t0}ms, ${result.size} groups")
         return if (result.isNotEmpty()) Pair(result, null) else tvResult
+    }
+
+    /**
+     * Rotates through different query sets on each refresh for content variety.
+     * Query pools are set by the app layer from string resources via setHomeQueryPools().
+     * Falls back to homeQueries if no pools are configured.
+     */
+    private fun getRotatedHomeQueries(): List<Pair<String, String>> {
+        val pools = homeQueryPools
+        if (pools.isEmpty()) return homeQueries
+        val idx = refreshCounter.getAndIncrement()
+        return pools[idx % pools.size]
     }
 
     /**
@@ -209,6 +220,17 @@ internal open class BrowseService2 {
          */
         @JvmStatic @Volatile
         var excludedVideoIds: Set<String> = emptySet()
+
+        /** Increments on each home refresh to rotate query pools */
+        @JvmStatic
+        val refreshCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /**
+         * Multiple query pools for rotation. Set by app layer from string resources.
+         * Each pool is a List of (title, query) pairs used for one refresh cycle.
+         */
+        @JvmStatic @Volatile
+        var homeQueryPools: List<List<Pair<String, String>>> = emptyList()
 
         /**
          * Prefetched video cache for next home refresh.
