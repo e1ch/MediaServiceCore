@@ -37,6 +37,10 @@ internal open class BrowseService2 {
      * Search THIS_WEEK first (triggers 新影片 badge).
      * If < 3 results, fallback to THIS_MONTH for more content.
      */
+    /** Public accessor for Trending tab fallback */
+    fun searchFreshPublic(query: String) = searchFresh(query)
+    fun getLanguageStopWordPublic() = getLanguageStopWord()
+
     private fun searchFresh(query: String): com.liskovsoft.youtubeapi.search.models.SearchResult? {
         val week = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK
         val month = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH

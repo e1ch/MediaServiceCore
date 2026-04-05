@@ -311,8 +311,36 @@ class YouTubeContentService implements ContentService {
                 // kworb failed, continue
             }
 
-            // No search-based "trending" queries — they return clickbait/SEO garbage.
-            // Trending tab relies on kworb (real trending data) only.
+            // YouTube Charts as secondary source (music-focused but better than nothing)
+            boolean hasContent = false;
+            try {
+                getBrowseService2().fetchYouTubeCharts(MediaGroup.TYPE_TRENDING, seenIds, excluded,
+                    group -> {
+                        if (group != null && !group.isEmpty()) {
+                            emitter.onNext(java.util.Collections.singletonList(group));
+                        }
+                    });
+                hasContent = true;
+            } catch (Exception e) {
+                // Charts failed too
+            }
+
+            // Language discovery fallback if both kworb and Charts failed
+            if (!hasContent && seenIds.isEmpty()) {
+                try {
+                    String stopWord = getBrowseService2().getLanguageStopWordPublic();
+                    com.liskovsoft.youtubeapi.search.models.SearchResult sr =
+                        getBrowseService2().searchFreshPublic(stopWord);
+                    if (sr != null) {
+                        java.util.List<MediaGroup> groups = com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup.from(sr, MediaGroup.TYPE_TRENDING);
+                        if (groups != null && !groups.isEmpty()) {
+                            emitter.onNext(groups);
+                        }
+                    }
+                } catch (Exception e) {
+                    // All sources failed
+                }
+            }
 
             emitter.onComplete();
         });
