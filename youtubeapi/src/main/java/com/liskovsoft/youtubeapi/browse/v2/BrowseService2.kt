@@ -144,16 +144,26 @@ internal open class BrowseService2 {
         val searchSemaphore = java.util.concurrent.Semaphore(2)
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
-        // kworb: always runs (MEDIUM + HARD)
+        // YouTube Charts: official trending data (1 API call, full metadata)
+        // Falls back to kworb if Charts unavailable
         futures.add(executor.submit {
             try {
-                val trendingGroup = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
-                if (trendingGroup != null) {
-                    trendingGroup.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
-                    onGroupReady.accept(trendingGroup)
+                val t0 = System.currentTimeMillis()
+                fetchYouTubeCharts(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded) { group ->
+                    group?.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
+                    onGroupReady.accept(group)
                 }
+                System.err.println("[PERF] YouTube Charts done: ${System.currentTimeMillis() - t0}ms")
             } catch (e: Exception) {
-                System.err.println("[PERF] kworb failed: ${e.message}")
+                // Fallback to kworb
+                System.err.println("[PERF] Charts failed, trying kworb: ${e.message}")
+                try {
+                    val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
+                    if (kworb != null) {
+                        kworb.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
+                        onGroupReady.accept(kworb)
+                    }
+                } catch (_: Exception) {}
             }
         })
 
@@ -303,6 +313,99 @@ internal open class BrowseService2 {
         }
 
         return result
+    }
+
+    /**
+     * Fetches trending videos from YouTube Charts API (official source).
+     * Returns two groups: TOP_VIEWS (most viewed) and TRENDING (rising).
+     * Single API call, full metadata included — no extra /player lookups needed.
+     */
+    private fun fetchYouTubeCharts(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>,
+                                   onGroupReady: java.util.function.Consumer<MediaGroup?>? = null): MediaGroup? {
+        val country = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().country ?: "US"
+        val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
+
+        val t0 = System.currentTimeMillis()
+        val chartsBody = """{"context":{"client":{"clientName":"WEB_MUSIC_ANALYTICS","clientVersion":"2.0","hl":"$lang","gl":"$country"}},"browseId":"FEmusic_analytics_charts_home","formData":{"selectedValues":["$country"]}}"""
+
+        val httpClient = RetrofitOkHttpHelper.client
+        val request = okhttp3.Request.Builder()
+            .url("https://charts.youtube.com/youtubei/v1/browse?key=AIzaSyCzEW8uGpBGMUAPJBOzXBbmMKxofHJTe9Q&prettyPrint=false")
+            .post(okhttp3.RequestBody.create(okhttp3.MediaType.parse("application/json"), chartsBody))
+            .build()
+
+        val response = try { httpClient.newCall(request).execute() } catch (e: Exception) { return null }
+        if (!response.isSuccessful) { response.close(); return null }
+        val body = response.body()?.string() ?: return null
+        response.close()
+
+        try {
+            val json = org.json.JSONObject(body)
+            val sections = json.getJSONObject("contents").getJSONObject("sectionListRenderer")
+                .getJSONArray("contents").getJSONObject(0)
+                .getJSONObject("musicAnalyticsSectionRenderer").getJSONObject("content")
+                .getJSONArray("videos")
+
+            for (i in 0 until sections.length()) {
+                val chart = sections.getJSONObject(i)
+                val listType = chart.optString("listType", "")
+                val videoViews = chart.getJSONArray("videoViews")
+
+                val title = when (listType) {
+                    "TRENDING_CHART" -> kworbTitle  // reuse localized title
+                    "TOP_VIEWS_CHART" -> when {
+                        lang.startsWith("zh") -> "🏆 排行榜"
+                        lang.startsWith("ko") -> "🏆 차트"
+                        lang.startsWith("ja") -> "🏆 ランキング"
+                        else -> "🏆 Top Charts"
+                    }
+                    else -> continue
+                }
+
+                val items = mutableListOf<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
+                val count = videoViews.length().coerceAtMost(20)
+
+                for (j in 0 until count) {
+                    val v = videoViews.getJSONObject(j)
+                    val videoId = v.optString("id", "")
+                    if (videoId.isEmpty() || seenIds.contains(videoId) || excluded.contains(videoId)) continue
+
+                    val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
+                    item.videoId = videoId
+                    item.title = v.optString("title", "")
+
+                    val artists = v.optJSONArray("artists")
+                    val artistName = if (artists != null && artists.length() > 0)
+                        artists.getJSONObject(0).optString("name", "") else ""
+                    item.author = artistName
+
+                    val thumbs = v.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+                    if (thumbs != null && thumbs.length() > 0) {
+                        item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
+                    }
+
+                    val viewCount = v.optString("viewCount", "")
+                    item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(
+                        artistName, if (viewCount.isNotEmpty()) formatViewCount(viewCount) else ""
+                    )
+
+                    seenIds.add(videoId)
+                    items.add(item)
+                }
+
+                if (items.isNotEmpty()) {
+                    val group = YouTubeMediaGroup(groupType)
+                    group.title = title
+                    group.mediaItems = java.util.ArrayList(items)
+                    onGroupReady?.accept(group) ?: return group // return first group if no callback
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("[PERF] YouTube Charts parse error: ${e.message}")
+        }
+
+        System.err.println("[PERF] YouTube Charts: ${System.currentTimeMillis() - t0}ms")
+        return null
     }
 
     /**
