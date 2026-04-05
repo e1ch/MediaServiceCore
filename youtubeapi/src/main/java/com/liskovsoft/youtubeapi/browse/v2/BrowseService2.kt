@@ -31,7 +31,6 @@ internal open class BrowseService2 {
         val tvResult = getBrowseRowsTV(BrowseApiHelper::getHomeQuery, MediaGroup.TYPE_HOME)
 
         // Check if TV result has real video content (not just login prompts/feedNudge).
-        // Only count items that have actual video IDs.
         val hasRealVideos = tvResult?.first?.any { group ->
             group?.mediaItems?.any { it?.videoId != null } == true
         } == true
@@ -40,14 +39,27 @@ internal open class BrowseService2 {
             return tvResult
         }
 
-        // Anonymous mode: TV/WEB home feeds return login prompts.
-        // Fall back to search-based content (like PrismTube).
-        val searchFallback = getSearchFallback(SEARCH_QUERIES_HOME, MediaGroup.TYPE_HOME)
-        if (searchFallback.isNotEmpty()) {
-            return Pair(searchFallback, null)
+        // Anonymous mode: use prefetched cache first, then fresh search fallback.
+        val result = mutableListOf<MediaGroup?>()
+
+        // 1. Consume prefetched groups (collected in background during playback)
+        if (prefetchedGroups.isNotEmpty()) {
+            result.addAll(prefetchedGroups)
+            prefetchedGroups.clear()
         }
 
-        return tvResult
+        // 2. Add fresh search results (excluding already-shown videos)
+        val searchFallback = getSearchFallback(SEARCH_QUERIES_HOME, MediaGroup.TYPE_HOME)
+        result.addAll(searchFallback)
+
+        // Track shown videoIds for future dedup
+        result.forEach { group ->
+            group?.mediaItems?.forEach { item ->
+                item?.videoId?.let { shownVideoIds.add(it) }
+            }
+        }
+
+        return if (result.isNotEmpty()) Pair(result, null) else tvResult
     }
 
     fun getTrending(): List<MediaGroup?>? {
@@ -113,6 +125,65 @@ internal open class BrowseService2 {
          */
         @JvmStatic @Volatile
         var excludedVideoIds: Set<String> = emptySet()
+
+        /**
+         * Prefetched video cache for next home refresh.
+         * Background search fills this while user watches a video.
+         * On next home load, these are shown first (fresher content).
+         */
+        @JvmStatic
+        val prefetchedGroups: MutableList<MediaGroup> = java.util.concurrent.CopyOnWriteArrayList()
+
+        /** Channel IDs already in prefetch — limits same-creator repetition */
+        @JvmStatic
+        val prefetchedChannelIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        /** Video IDs already shown or prefetched — prevents duplicates across refreshes */
+        @JvmStatic
+        val shownVideoIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        @JvmStatic
+        fun clearPrefetchCache() {
+            prefetchedGroups.clear()
+            prefetchedChannelIds.clear()
+            // Don't clear shownVideoIds — persists across refreshes to avoid repeats
+        }
+    }
+
+    /**
+     * Background prefetch: search for fresh videos and cache them.
+     * Called during video playback to prepare content for next home refresh.
+     * Limits same-creator repetition (max 2 videos per channel across prefetch).
+     */
+    fun prefetchForHome(queries: List<Pair<String, String>>) {
+        val maxPerChannel = 2
+        for ((title, query) in queries) {
+            val searchResult = RetrofitHelper.get(
+                mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
+            ) ?: continue
+
+            val groups = YouTubeMediaGroup.from(searchResult, MediaGroup.TYPE_HOME) ?: continue
+            val group = groups.firstOrNull() ?: continue
+            (group as? YouTubeMediaGroup)?.title = "$title ✦"
+
+            // Filter: no dupes, no watched, limit per creator
+            group.mediaItems?.removeAll { item ->
+                val id = item?.videoId ?: return@removeAll true
+                val channelId = item.channelId ?: ""
+                val excluded = excludedVideoIds
+                // Skip if already shown, watched, or too many from same channel
+                shownVideoIds.contains(id) ||
+                excluded.contains(id) ||
+                (channelId.isNotEmpty() &&
+                    java.util.Collections.frequency(prefetchedChannelIds.toList(), channelId) >= maxPerChannel &&
+                    !prefetchedChannelIds.add(channelId + "_skip")) ||
+                !shownVideoIds.add(id).also { if (it && channelId.isNotEmpty()) prefetchedChannelIds.add(channelId) }
+            }
+
+            if (group.isEmpty != true) {
+                prefetchedGroups.add(group)
+            }
+        }
     }
 
     fun getSports(): Pair<List<MediaGroup?>?, String?>? {
