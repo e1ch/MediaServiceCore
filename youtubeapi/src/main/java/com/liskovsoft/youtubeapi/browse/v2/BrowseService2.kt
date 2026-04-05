@@ -723,25 +723,28 @@ internal open class BrowseService2 {
     }
 
     /** Format view count: 7598293 → "759萬次觀看" */
+    /** Format view count to match YouTube's native format:
+     *  zh: "觀看次數：759萬次"  ko: "조회수 759만회"  ja: "759万 回視聴"  en: "7.5M views" */
     private fun formatViewCount(count: String): String {
         val n = count.toLongOrNull() ?: return ""
         if (n <= 0) return ""
         val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
         return when {
             lang.startsWith("zh") -> when {
-                n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}億次觀看"
-                n >= 10_000 -> "${n / 10_000}萬次觀看"
-                else -> "${n}次觀看"
+                n >= 100_000_000 -> "觀看次數：${n / 100_000_000}億次"
+                n >= 10_000 -> "觀看次數：${n / 10_000}萬次"
+                n >= 1_000 -> "觀看次數：${n / 1_000}千次"
+                else -> "觀看次數：${n}次"
             }
             lang.startsWith("ko") -> when {
-                n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}억회"
-                n >= 10_000 -> "${n / 10_000}만회"
-                else -> "${n}회"
+                n >= 100_000_000 -> "조회수 ${n / 100_000_000}억회"
+                n >= 10_000 -> "조회수 ${n / 10_000}만회"
+                else -> "조회수 ${n}회"
             }
             lang.startsWith("ja") -> when {
-                n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}億回"
-                n >= 10_000 -> "${n / 10_000}万回"
-                else -> "${n}回"
+                n >= 100_000_000 -> "${n / 100_000_000}億回視聴"
+                n >= 10_000 -> "${n / 10_000}万回視聴"
+                else -> "${n}回視聴"
             }
             else -> when {
                 n >= 1_000_000_000 -> "${n / 1_000_000_000}.${(n % 1_000_000_000) / 100_000_000}B views"
