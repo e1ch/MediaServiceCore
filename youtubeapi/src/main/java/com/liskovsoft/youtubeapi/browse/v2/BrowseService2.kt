@@ -282,27 +282,26 @@ internal open class BrowseService2 {
     }
 
     /**
-     * Fetches real trending video IDs from kworb.net for user's country,
-     * then looks up each video individually via YouTube search (100% match rate).
-     * Each ID searched in parallel for speed.
+     * Fetches real trending video IDs from kworb.net, then uses /player endpoint
+     * to get metadata for each video. /player is lightweight (no search ranking,
+     * no auth format issues) and ~30ms per call in parallel.
      */
     private fun fetchKworbTrending(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
         val country = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().country ?: "US"
+        val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
 
         // 1. Fetch kworb trending page
         val t0 = System.currentTimeMillis()
         val url = "https://kworb.net/youtube/trending/${country.lowercase()}.html"
-        val client = okhttp3.OkHttpClient.Builder()
-            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS).build()
+        val httpClient = RetrofitOkHttpHelper.client
         val request = okhttp3.Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
-        val response = try { client.newCall(request).execute() } catch (e: Exception) { return null }
+        val response = try { httpClient.newCall(request).execute() } catch (e: Exception) { return null }
         if (!response.isSuccessful) { response.close(); return null }
         val body = response.body()?.string() ?: return null
         response.close()
-        System.err.println("[PERF] kworb fetch took ${System.currentTimeMillis() - t0}ms")
+        System.err.println("[PERF] kworb fetch: ${System.currentTimeMillis() - t0}ms")
 
-        // 2. Extract video IDs (top 20)
+        // 2. Extract video IDs (top 20, skip watched/seen)
         val videoIds = Regex("youtube\\.com/watch\\?v=([A-Za-z0-9_-]{11})")
             .findAll(body)
             .map { it.groupValues[1] }
@@ -312,59 +311,78 @@ internal open class BrowseService2 {
             .toList()
         if (videoIds.isEmpty()) return null
 
-        // 3. Search each ID individually in parallel (100% match rate)
+        // 3. Fetch metadata via /player (lightweight, no search ranking)
         val t1 = System.currentTimeMillis()
-        val executor = java.util.concurrent.Executors.newFixedThreadPool(5)
-        val allItems = java.util.concurrent.CopyOnWriteArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(4)
+        val allItems = java.util.concurrent.CopyOnWriteArrayList<com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem>()
+
+        val playerBody = """{"context":{"client":{"clientName":"WEB","clientVersion":"2.20260401.08.00","hl":"$lang","gl":"$country"}},"videoId":"%s"}"""
 
         val futures = videoIds.map { videoId ->
             executor.submit {
                 try {
-                    val sr = searchWithVisitorData(videoId)
-                    if (sr == null) {
-                        System.err.println("[PERF] kworb lookup $videoId: search returned null")
-                    }
-                    sr?.let {
-                        val groups = YouTubeMediaGroup.from(it, groupType)
-                        if (groups.isNullOrEmpty()) {
-                            System.err.println("[PERF] kworb lookup $videoId: groups null/empty (sections=${it.sections?.size})")
-                        }
-                        // Take the first result that matches this exact videoId
-                        val matched = groups?.firstOrNull()?.mediaItems?.firstOrNull { item ->
-                            item?.videoId == videoId
-                        }
-                        if (matched != null) {
-                            allItems.add(matched)
-                            seenIds.add(videoId)
-                        } else {
-                            // Fallback: take first video result even if ID doesn't match exactly
-                            groups?.firstOrNull()?.mediaItems?.firstOrNull { item ->
-                                item?.videoId != null
-                            }?.let { item ->
-                                allItems.add(item)
-                                seenIds.add(item.videoId)
-                            }
-                        }
+                    val playerRequest = okhttp3.Request.Builder()
+                        .url("https://www.youtube.com/youtubei/v1/player?key=${com.liskovsoft.youtubeapi.common.helpers.AppConstants.API_KEY}&prettyPrint=false")
+                        .post(okhttp3.RequestBody.create(
+                            okhttp3.MediaType.parse("application/json"),
+                            String.format(playerBody, videoId)))
+                        .build()
+                    val playerResponse = httpClient.newCall(playerRequest).execute()
+                    if (playerResponse.isSuccessful) {
+                        val json = playerResponse.body()?.string()
+                        playerResponse.close()
+                        json?.let { parsePlayerToVideo(it, videoId) }?.let { allItems.add(it) }
+                    } else {
+                        playerResponse.close()
                     }
                 } catch (_: Exception) {}
             }
         }
 
         for (f in futures) {
-            try { f.get(10, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
+            try { f.get(8, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
         }
         executor.shutdown()
-        System.err.println("[PERF] kworb video lookups: ${allItems.size}/${videoIds.size} found in ${System.currentTimeMillis() - t1}ms")
+        System.err.println("[PERF] kworb /player lookups: ${allItems.size}/${videoIds.size} in ${System.currentTimeMillis() - t1}ms")
 
         if (allItems.isEmpty()) return null
 
-        // 4. Build a MediaGroup from the matched items
+        // 4. Build MediaGroup preserving kworb ranking order
+        val orderedItems = videoIds.mapNotNull { id -> allItems.firstOrNull { it.videoId == id } }
+        orderedItems.forEach { seenIds.add(it.videoId) }
+
         val group = YouTubeMediaGroup(groupType)
         group.title = kworbTitle
-        // Preserve kworb ranking order
-        val orderedItems = videoIds.mapNotNull { id -> allItems.firstOrNull { it.videoId == id } }
-        group.mediaItems = java.util.ArrayList(orderedItems)
+        group.mediaItems = java.util.ArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>(orderedItems)
         return group
+    }
+
+    /** Parse /player JSON into a YouTubeMediaItem for UI display */
+    private fun parsePlayerToVideo(json: String, videoId: String): com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem? {
+        try {
+            val obj = org.json.JSONObject(json)
+            val vd = obj.optJSONObject("videoDetails") ?: return null
+            val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
+            item.videoId = vd.optString("videoId", videoId)
+            item.title = vd.optString("title", "")
+            item.author = vd.optString("author", "")
+            val thumbs = vd.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+            if (thumbs != null && thumbs.length() > 0) {
+                item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
+            }
+            // durationMs is read-only in YouTubeMediaItem (computed from internal model)
+            return item
+        } catch (_: Exception) { return null }
+    }
+
+    private fun formatViewCount(count: String): String {
+        val n = count.toLongOrNull() ?: return count
+        return when {
+            n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}億次觀看"
+            n >= 10_000 -> "${n / 10_000}萬次觀看"
+            n >= 1000 -> "${n / 1000}千次觀看"
+            else -> "${n}次觀看"
+        }
     }
 
     private fun addSearchResult(
