@@ -301,4 +301,12 @@ public class YouTubeMediaGroup implements MediaGroup {
 
         return baseGroup;
     }
+
+    /**
+     * QoS: playback state flag for search throttling.
+     * When true, background searches reduce concurrency to yield bandwidth to video.
+     */
+    private static volatile boolean sPlaybackActive = false;
+    public static void setPlaybackActive(boolean active) { sPlaybackActive = active; }
+    public static boolean isPlaybackActive() { return sPlaybackActive; }
 }

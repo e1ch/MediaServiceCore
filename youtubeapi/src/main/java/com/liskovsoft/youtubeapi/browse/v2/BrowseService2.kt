@@ -158,11 +158,13 @@ internal open class BrowseService2 {
         val excluded = excludedVideoIds
         val random = java.util.Random()
 
-        // Low priority threads: don't compete with video playback for CPU/network
-        val executor = java.util.concurrent.Executors.newFixedThreadPool(3) { r ->
+        // QoS: reduce concurrency when video is playing
+        val maxConcurrent = if (YouTubeMediaGroup.isPlaybackActive()) 1 else 3
+        val jitterMs = if (YouTubeMediaGroup.isPlaybackActive()) 800 else 200
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(maxConcurrent) { r ->
             Thread(r).apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
         }
-        val searchSemaphore = java.util.concurrent.Semaphore(2)
+        val searchSemaphore = java.util.concurrent.Semaphore(if (YouTubeMediaGroup.isPlaybackActive()) 1 else 2)
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
         // YouTube Charts: official trending data (1 API call, full metadata)
@@ -232,8 +234,8 @@ internal open class BrowseService2 {
             futures.add(executor.submit {
                 try {
                     searchSemaphore.acquire()
-                    // Jitter: 200-400ms random delay to spread requests
-                    Thread.sleep(200L + random.nextInt(200))
+                    // Jitter: adaptive delay (longer when video is playing)
+                    Thread.sleep(jitterMs.toLong() + random.nextInt(jitterMs))
                     val tq = System.currentTimeMillis()
                     val sr = searchFresh(query)
                     System.err.println("[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
