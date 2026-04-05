@@ -158,7 +158,10 @@ internal open class BrowseService2 {
         val excluded = excludedVideoIds
         val random = java.util.Random()
 
-        val executor = java.util.concurrent.Executors.newFixedThreadPool(3)
+        // Low priority threads: don't compete with video playback for CPU/network
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(3) { r ->
+            Thread(r).apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
+        }
         val searchSemaphore = java.util.concurrent.Semaphore(2)
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
