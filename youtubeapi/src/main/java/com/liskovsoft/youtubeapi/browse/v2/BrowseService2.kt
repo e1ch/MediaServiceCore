@@ -103,8 +103,15 @@ internal open class BrowseService2 {
      * then remaining queries run in parallel. This avoids concurrent initialization
      * conflicts that cause timeouts on cold start.
      */
+    /**
+     * Search with "this year" upload date filter for fresh content.
+     * First query sequential (TLS warmup), rest parallel.
+     */
     fun getSearchFallbackParallel(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
         if (queries.isEmpty()) return emptyList()
+
+        // Use "This Year" upload date filter to avoid old clickbait
+        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_YEAR
 
         val result = mutableListOf<MediaGroup?>()
         val seenIds = mutableSetOf<String>()
@@ -114,20 +121,20 @@ internal open class BrowseService2 {
         val first = queries.first()
         val t1 = System.currentTimeMillis()
         val firstResult = RetrofitHelper.get(
-            mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(first.second))
+            mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(first.second, dateFilter))
         )
         System.err.println("[PERF] first search '${first.second}' took ${System.currentTimeMillis() - t1}ms (warmup)")
         addSearchResult(firstResult, first.first, groupType, result, seenIds, excluded)
 
-        // 2. Remaining queries: parallel (connection already warm)
-        if (queries.size > 1) {
-            val remaining = queries.drop(1)
-            val executor = java.util.concurrent.Executors.newFixedThreadPool(remaining.size.coerceAtMost(3))
+        // 2. Remaining queries + kworb trending: parallel
+        val remaining = queries.drop(1).toMutableList()
+        if (remaining.isNotEmpty()) {
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(remaining.size.coerceAtMost(4))
             val futures = remaining.map { (title, query) ->
                 executor.submit(java.util.concurrent.Callable {
                     val tq = System.currentTimeMillis()
                     val sr = RetrofitHelper.get(
-                        mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
+                        mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query, dateFilter))
                     )
                     System.err.println("[PERF] parallel search '$query' took ${System.currentTimeMillis() - tq}ms")
                     Pair(title, sr)
@@ -144,7 +151,71 @@ internal open class BrowseService2 {
             executor.shutdown()
         }
 
+        // 3. Mix in kworb real trending (regional + global)
+        try {
+            val trendingGroup = fetchKworbTrending(groupType, seenIds, excluded)
+            if (trendingGroup != null) {
+                result.add(0, trendingGroup) // Put trending first
+            }
+        } catch (e: Exception) {
+            System.err.println("[PERF] kworb fetch failed: ${e.message}")
+        }
+
         return result
+    }
+
+    /**
+     * Fetches real trending video IDs from kworb.net, then looks them up via search.
+     * Returns a MediaGroup with real trending videos.
+     */
+    private fun fetchKworbTrending(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
+        val country = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().country ?: "US"
+        val countryLower = country.lowercase()
+
+        // Fetch regional trending page
+        val url = "https://kworb.net/youtube/trending/${countryLower}.html"
+        val client = okhttp3.OkHttpClient.Builder().connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS).build()
+
+        val request = okhttp3.Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+        val response = try { client.newCall(request).execute() } catch (e: Exception) { return null }
+
+        if (!response.isSuccessful) {
+            response.close()
+            return null
+        }
+
+        val body = response.body()?.string() ?: return null
+        response.close()
+
+        // Extract video IDs from the HTML
+        val videoIds = Regex("youtube\\.com/watch\\?v=([A-Za-z0-9_-]{11})")
+            .findAll(body)
+            .map { it.groupValues[1] }
+            .filter { !seenIds.contains(it) && !excluded.contains(it) }
+            .distinct()
+            .take(10)
+            .toList()
+
+        if (videoIds.isEmpty()) return null
+
+        // Search for these videos by ID to get full metadata
+        val topIds = videoIds.take(5).joinToString(" | ")
+        val searchResult = RetrofitHelper.get(
+            mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(topIds))
+        )
+
+        return searchResult?.let {
+            val groups = YouTubeMediaGroup.from(it, groupType)
+            groups?.firstOrNull()?.let { group ->
+                (group as? YouTubeMediaGroup)?.title = kworbTitle
+                group.mediaItems?.removeAll { item ->
+                    val id = item?.videoId ?: return@removeAll false
+                    !seenIds.add(id) || excluded.contains(id)
+                }
+                if (group.isEmpty != true) group else null
+            }
+        }
     }
 
     private fun addSearchResult(
@@ -220,6 +291,10 @@ internal open class BrowseService2 {
          */
         @JvmStatic @Volatile
         var excludedVideoIds: Set<String> = emptySet()
+
+        /** Kworb trending section title, set from string resources by app layer */
+        @JvmStatic @Volatile
+        var kworbTitle: String = "Trending Now"
 
         /** Increments on each home refresh to rotate query pools */
         @JvmStatic
