@@ -126,20 +126,25 @@ internal open class BrowseService2 {
      * - each result emitted as soon as ready
      */
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
-        val queries = getRotatedHomeQueries()
-        if (queries.isEmpty()) return
+        val level = getRefreshLevel()
+        System.err.println("[PERF] refresh level: ${when(level) { REFRESH_SOFT -> "SOFT" ; REFRESH_MEDIUM -> "MEDIUM"; else -> "HARD" }}")
 
+        if (level == REFRESH_SOFT) {
+            // Soft refresh: Phase 1 only, skip all network calls
+            return
+        }
+
+        val queries = getRotatedHomeQueries()
         val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_YEAR
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val excluded = excludedVideoIds
         val random = java.util.Random()
 
-        // Thread pool: 2 for search + 1 for kworb = 3 max concurrent
         val executor = java.util.concurrent.Executors.newFixedThreadPool(3)
-        val searchSemaphore = java.util.concurrent.Semaphore(2) // max 2 concurrent searches
+        val searchSemaphore = java.util.concurrent.Semaphore(2)
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
-        // kworb: runs immediately (uses /player, no semaphore needed)
+        // kworb: always runs (MEDIUM + HARD)
         futures.add(executor.submit {
             try {
                 val trendingGroup = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
@@ -152,7 +157,14 @@ internal open class BrowseService2 {
             }
         })
 
-        // Search queries: max 2 concurrent, 200-400ms jitter between starts
+        // Search queries: only on HARD refresh, max 2 concurrent, 200-400ms jitter
+        if (level < REFRESH_HARD || queries.isEmpty()) {
+            for (f in futures) { try { f.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
+            executor.shutdown()
+            lastFullRefreshMs = System.currentTimeMillis()
+            return
+        }
+
         for ((title, query) in queries) {
             futures.add(executor.submit {
                 try {
@@ -189,6 +201,7 @@ internal open class BrowseService2 {
             try { f.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
         }
         executor.shutdown()
+        lastFullRefreshMs = System.currentTimeMillis()
     }
 
     /** Legacy single-call (used by non-Observable getHome in YouTubeContentService) */
@@ -561,6 +574,30 @@ internal open class BrowseService2 {
         /** Increments on each home refresh to rotate query pools */
         @JvmStatic
         val refreshCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /** Last full refresh timestamp — used for refresh throttling */
+        @JvmStatic @Volatile
+        var lastFullRefreshMs: Long = 0
+
+        /**
+         * Determines refresh level based on time since last full refresh.
+         * - SOFT (< 30s): skip Phase 2 entirely, only show Phase 1 (TV + prefetch)
+         * - MEDIUM (30-120s): only run kworb, skip search queries
+         * - HARD (> 120s): full Phase 2 (kworb + search)
+         */
+        @JvmStatic
+        fun getRefreshLevel(): Int {
+            val elapsed = System.currentTimeMillis() - lastFullRefreshMs
+            return when {
+                elapsed < 30_000 -> REFRESH_SOFT
+                elapsed < 120_000 -> REFRESH_MEDIUM
+                else -> REFRESH_HARD
+            }
+        }
+
+        const val REFRESH_SOFT = 0
+        const val REFRESH_MEDIUM = 1
+        const val REFRESH_HARD = 2
 
         /**
          * Multiple query pools for rotation. Set by app layer from string resources.
