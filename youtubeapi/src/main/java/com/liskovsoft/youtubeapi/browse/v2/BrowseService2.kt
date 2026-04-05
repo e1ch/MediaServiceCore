@@ -119,27 +119,51 @@ internal open class BrowseService2 {
      * All queries run in parallel; whoever finishes first emits first.
      * kworb also runs in parallel alongside search queries.
      */
+    /**
+     * Streaming Phase 2:
+     * - kworb runs immediately (uses /player, fast, no rate limit risk)
+     * - search queries use semaphore (max 2 concurrent) + jitter to avoid rate limiting
+     * - each result emitted as soon as ready
+     */
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         val queries = getRotatedHomeQueries()
         if (queries.isEmpty()) return
 
         val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_YEAR
-        // Only dedup across Phase 2 search results, NOT against Phase 1 TV results.
-        // This ensures trending/search content always appears even if TV already showed some.
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-        val excluded = excludedVideoIds // watched videos only
+        val excluded = excludedVideoIds
+        val random = java.util.Random()
 
-        val executor = java.util.concurrent.Executors.newFixedThreadPool(queries.size.coerceAtMost(4) + 1)
-
-        // Submit ALL searches + kworb concurrently
+        // Thread pool: 2 for search + 1 for kworb = 3 max concurrent
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(3)
+        val searchSemaphore = java.util.concurrent.Semaphore(2) // max 2 concurrent searches
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
+        // kworb: runs immediately (uses /player, no semaphore needed)
+        futures.add(executor.submit {
+            try {
+                val trendingGroup = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
+                if (trendingGroup != null) {
+                    trendingGroup.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
+                    onGroupReady.accept(trendingGroup)
+                }
+            } catch (e: Exception) {
+                System.err.println("[PERF] kworb failed: ${e.message}")
+            }
+        })
+
+        // Search queries: max 2 concurrent, 200-400ms jitter between starts
         for ((title, query) in queries) {
             futures.add(executor.submit {
                 try {
+                    searchSemaphore.acquire()
+                    // Jitter: 200-400ms random delay to spread requests
+                    Thread.sleep(200L + random.nextInt(200))
                     val tq = System.currentTimeMillis()
                     val sr = searchWithVisitorData(query, dateFilter)
-                    System.err.println("[PERF] stream search '$query' took ${System.currentTimeMillis() - tq}ms")
+                    System.err.println("[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
+                    searchSemaphore.release()
+
                     sr?.let {
                         val groups = YouTubeMediaGroup.from(it, MediaGroup.TYPE_HOME)
                         groups?.firstOrNull()?.let { group ->
@@ -155,27 +179,14 @@ internal open class BrowseService2 {
                         }
                     }
                 } catch (e: Exception) {
-                    System.err.println("[PERF] stream search failed: ${e.message}")
+                    searchSemaphore.release()
+                    System.err.println("[PERF] search failed: ${e.message}")
                 }
             })
         }
 
-        // kworb in parallel
-        futures.add(executor.submit {
-            try {
-                val trendingGroup = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
-                if (trendingGroup != null) {
-                    trendingGroup.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
-                    onGroupReady.accept(trendingGroup)
-                }
-            } catch (e: Exception) {
-                System.err.println("[PERF] kworb stream failed: ${e.message}")
-            }
-        })
-
-        // Wait for all to complete
         for (f in futures) {
-            try { f.get(20, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
+            try { f.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
         }
         executor.shutdown()
     }
@@ -301,15 +312,18 @@ internal open class BrowseService2 {
         response.close()
         System.err.println("[PERF] kworb fetch: ${System.currentTimeMillis() - t0}ms")
 
-        // 2. Extract video IDs (top 20, skip watched/seen)
-        val videoIds = Regex("youtube\\.com/watch\\?v=([A-Za-z0-9_-]{11})")
+        // 2. Extract ALL video IDs, then randomly sample 20 for variety
+        val allIds = Regex("youtube\\.com/watch\\?v=([A-Za-z0-9_-]{11})")
             .findAll(body)
             .map { it.groupValues[1] }
             .filter { !seenIds.contains(it) && !excluded.contains(it) }
             .distinct()
-            .take(20)
             .toList()
-        if (videoIds.isEmpty()) return null
+        if (allIds.isEmpty()) return null
+
+        // Shuffle and take 20 — each refresh gets a different mix from the full trending list
+        val videoIds = allIds.shuffled(java.util.Random()).take(20)
+        System.err.println("[PERF] kworb: ${allIds.size} total IDs, sampled ${videoIds.size}")
 
         // 3. Fetch metadata via /player (lightweight, no search ranking)
         val t1 = System.currentTimeMillis()
