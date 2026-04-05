@@ -26,12 +26,14 @@ internal open class BrowseService2 {
      * When signed in, auth headers cause TV-format responses that our SearchResult can't parse.
      * Uses addAuthSkip to force API-key mode even when signed in.
      */
+    /**
+     * Home/trending search: uses WEB client (getSearchQueryWeb).
+     * Separate from user search which uses TV client (getSearchQuery).
+     * Auth is auto-skipped for /v1/search in the OkHttp interceptor.
+     */
     private fun searchWithVisitorData(query: String, options: Int = -1): com.liskovsoft.youtubeapi.search.models.SearchResult? {
-        val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQuery(query, options)
-        val call = mSearchApi.getSearchResult(searchQuery)
-        // Tell OkHttp interceptor to skip auth for this request (use API key instead)
-        call.request()?.let { RetrofitOkHttpHelper.addAuthSkip(it) }
-        return RetrofitHelper.get(call)
+        val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQueryWeb(query, options)
+        return RetrofitHelper.get(mSearchApi.getSearchResult(searchQuery))
     }
     /**
      * Search THIS_WEEK first (triggers 新影片 badge).

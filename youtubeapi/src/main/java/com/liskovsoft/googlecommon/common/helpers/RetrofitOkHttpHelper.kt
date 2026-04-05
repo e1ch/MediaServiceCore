@@ -81,10 +81,7 @@ internal object RetrofitOkHttpHelper {
             val url = request.url().toString()
 
             if (apiPrefixes.any { url.startsWith(it) }) {
-                // Search uses WEB client format which is incompatible with TV OAuth auth.
-                // Always skip auth for /search to prevent TV-format JSON responses.
-                val isSearchEndpoint = url.contains("/v1/search")
-                val doSkipAuth = isSearchEndpoint || authSkipList.remove(request)
+                val doSkipAuth = authSkipList.remove(request)
 
                 // Empty Home fix (anonymous user) and improve Recommendations for everyone
                 if (visitorApiSuffixes.any { url.contains(it) })

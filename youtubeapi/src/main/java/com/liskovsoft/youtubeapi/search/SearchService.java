@@ -31,10 +31,8 @@ public class SearchService {
     }
 
     public SearchResult getSearch(String searchText, int options) {
+        // User search uses TV client (original SmartTube behavior) — fast, auth-compatible
         Call<SearchResult> wrapper = mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(searchText, options), getAppService().getVisitorData());
-        // Skip auth headers: WEB client search format must be used (not TV format)
-        // Without this, signed-in users get TV-format JSON that SearchResult can't parse
-        try { RetrofitOkHttpHelper.addAuthSkip(wrapper.request()); } catch (Exception ignored) {}
         SearchResult searchResult = RetrofitHelper.get(wrapper);
 
 
@@ -56,7 +54,6 @@ public class SearchService {
         }
 
         Call<SearchResultContinuation> wrapper = mSearchApi.continueSearchResult(SearchApiHelper.getContinuationQuery(nextSearchPageKey));
-        try { RetrofitOkHttpHelper.addAuthSkip(wrapper.request()); } catch (Exception ignored) {}
         SearchResultContinuation searchResult = RetrofitHelper.get(wrapper);
 
         if (searchResult == null) {
