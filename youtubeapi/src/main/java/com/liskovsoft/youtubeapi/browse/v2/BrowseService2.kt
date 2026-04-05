@@ -195,7 +195,9 @@ internal open class BrowseService2 {
                                 val id = item?.videoId ?: return@removeAll false
                                 !seenIds.add(id) || excluded.contains(id)
                             }
-                            if (group.isEmpty != true) {
+                            // Only show groups with 3+ items (avoid "only 1-2 videos" shelves)
+                            val mediaItems = group.mediaItems
+                            if (mediaItems != null && mediaItems.size >= 3) {
                                 group.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
                                 onGroupReady.accept(group)
                             }

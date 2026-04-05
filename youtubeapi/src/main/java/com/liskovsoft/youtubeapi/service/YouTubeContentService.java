@@ -296,10 +296,31 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
+            // YouTube Charts: all chart categories (trending + top + songs)
+            try {
+                java.util.Set<String> seenIds = new java.util.HashSet<>();
+                getBrowseService2().fetchYouTubeCharts(MediaGroup.TYPE_TRENDING, seenIds,
+                    com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getExcludedVideoIds(),
+                    group -> {
+                        if (group != null && !group.isEmpty()) {
+                            emitter.onNext(java.util.Collections.singletonList(group));
+                        }
+                    });
+            } catch (Exception e) {
+                // Charts failed, continue with search
+            }
+
+            // Search-based results for non-music variety
             long t0 = System.currentTimeMillis();
-            List<MediaGroup> trending = getBrowseService2().getTrending();
-            System.err.println("[PERF] getTrending total: " + (System.currentTimeMillis() - t0) + "ms");
-            emitGroups(emitter, trending);
+            List<MediaGroup> search = getBrowseService2().getSearchFallbackParallel(
+                com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getTrendingQueries(),
+                MediaGroup.TYPE_TRENDING);
+            System.err.println("[PERF] getTrending search: " + (System.currentTimeMillis() - t0) + "ms");
+            if (search != null && !search.isEmpty()) {
+                emitter.onNext(search);
+            }
+
+            emitter.onComplete();
         });
     }
 
