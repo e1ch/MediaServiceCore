@@ -39,7 +39,11 @@ internal open class BrowseService2 {
      * Must skip auth: when signed in, auth headers cause TV-format JSON responses
      * that our WEB SearchResult paths can't parse (returns 0 items).
      */
-    private fun searchWithVisitorData(query: String, options: Int = -1): com.liskovsoft.youtubeapi.search.models.SearchResult? {
+    /**
+     * Home discovery search via WEB client + streaming parser.
+     * Returns List<MediaItem> directly (no SearchResult/JsonPath overhead).
+     */
+    private fun searchWebFast(query: String, options: Int = -1): List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem> {
         val t0 = System.currentTimeMillis()
         val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQueryWeb(query, options)
         val request = okhttp3.Request.Builder()
@@ -48,44 +52,61 @@ internal open class BrowseService2 {
             .build()
         val response = try { plainHttpClient.newCall(request).execute() } catch (e: Exception) {
             Log.d(TAG, "[PERF] WEB search error: ${e.message}")
-            return null
+            return emptyList()
         }
         val t1 = System.currentTimeMillis()
-        if (!response.isSuccessful) { Log.d(TAG, "[PERF] WEB search HTTP ${response.code()}"); response.close(); return null }
-        val bodyStream = response.body()?.byteStream() ?: return null
+        if (!response.isSuccessful) { Log.d(TAG, "[PERF] WEB search HTTP ${response.code()}"); response.close(); return emptyList() }
         return try {
-            val conf = com.jayway.jsonpath.Configuration.builder()
-                .mappingProvider(com.jayway.jsonpath.spi.mapper.GsonMappingProvider())
-                .jsonProvider(com.jayway.jsonpath.spi.json.GsonJsonProvider())
-                .build()
-            val adapter = com.liskovsoft.googlecommon.common.converters.jsonpath.typeadapter.JsonPathTypeAdapter<com.liskovsoft.youtubeapi.search.models.SearchResult>(
-                com.jayway.jsonpath.JsonPath.using(conf),
-                com.liskovsoft.youtubeapi.search.models.SearchResult::class.java
-            )
-            val result = adapter.read(bodyStream)
+            val liteItems = com.liskovsoft.youtubeapi.search.fast.SearchStreamingParser.parse(response.body()?.byteStream())
+            response.close()
             val t2 = System.currentTimeMillis()
-            Log.d(TAG, "[PERF] WEB search '$query': http=${t1-t0}ms parse=${t2-t1}ms total=${t2-t0}ms")
-            result
+            Log.d(TAG, "[PERF] WEB search '$query': http=${t1-t0}ms parse=${t2-t1}ms items=${liteItems.size}")
+            // Convert VideoItemLite -> YouTubeMediaItem
+            liteItems.mapNotNull { v ->
+                if (v.videoId == null) return@mapNotNull null
+                val mi = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
+                mi.videoId = v.videoId
+                mi.title = v.title
+                mi.author = v.channelName
+                mi.channelId = v.channelId
+                mi.cardImageUrl = v.thumbnailUrl
+                mi.badgeText = v.lengthText
+                mi.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(
+                    v.channelName, v.viewCountText, v.publishedTime)
+                mi as com.liskovsoft.mediaserviceinterfaces.data.MediaItem
+            }
         } catch (e: Exception) {
             Log.d(TAG, "[PERF] WEB search parse error: ${e.message}")
-            null
-        } finally {
             response.close()
+            emptyList()
         }
     }
-    /** Search THIS_WEEK first; fallback to THIS_MONTH if < 3 results. */
-    fun searchFreshPublic(query: String) = searchFresh(query)
     fun getLanguageStopWordPublic() = getLanguageStopWord()
 
-    private fun searchFresh(query: String): com.liskovsoft.youtubeapi.search.models.SearchResult? {
+    /** Search THIS_WEEK first; fallback to THIS_MONTH if < 3 results. Returns List<MediaItem>. */
+    private fun searchFreshItems(query: String): List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem> {
         val week = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK
         val month = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH
-        var sr = searchWithVisitorData(query, week)
-        val count = sr?.sections?.firstOrNull()?.itemWrappers?.size ?: 0
-        if (count < 3) {
-            sr = searchWithVisitorData(query, month)
+        var items = searchWebFast(query, week)
+        if (items.size < 3) {
+            items = searchWebFast(query, month)
         }
-        return sr
+        return items
+    }
+
+    /** Public accessor for trending tab */
+    fun searchFreshPublic(query: String) = searchFreshItems(query)
+
+    /**
+     * Legacy wrapper: returns a MediaGroup from streaming search.
+     * Used by getSearchFallbackParallel, getSearchFallback, prefetchForHome.
+     */
+    private fun searchFresh(query: String): MediaGroup? {
+        val items = searchFreshItems(query)
+        if (items.isEmpty()) return null
+        val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
+        group.mediaItems = java.util.ArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>(items)
+        return group
     }
 
     /**
@@ -162,6 +183,7 @@ internal open class BrowseService2 {
 
     fun emitCachedPool(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         cacheAlreadyEmitted = false
+        if (!unifiedShelf) return // Non-unified modes: no "For You ✦" shelf, show separate categories instead
         if (cachedPoolJson != null) {
             val cached = deserializePool(cachedPoolJson!!)
             if (cached.size >= MIN_POOL_SIZE) {
@@ -176,9 +198,14 @@ internal open class BrowseService2 {
         }
     }
 
+    private var activeExecutor: java.util.concurrent.ExecutorService? = null
+
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         val level = getRefreshLevel()
         if (level == REFRESH_SOFT) return
+
+        // Shutdown previous executor to prevent stale results from old refresh
+        activeExecutor?.shutdownNow()
 
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val excluded = excludedVideoIds
@@ -203,6 +230,7 @@ internal open class BrowseService2 {
         val executor = java.util.concurrent.Executors.newFixedThreadPool(maxConcurrent) { r ->
             Thread(r).apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
         }
+        activeExecutor = executor
         val searchSemaphore = java.util.concurrent.Semaphore(if (playbackActive) 1 else 2)
 
         val addToPool = { items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
@@ -219,64 +247,110 @@ internal open class BrowseService2 {
             Unit
         }
 
+        // When separate shelves mode: emit each source as its own named group
+        val emitSeparate = { title: String, items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
+            if (!unifiedShelf && items != null && items.isNotEmpty()) {
+                val filtered = items.filter { seenIds.add(it.videoId ?: "") && !excluded.contains(it.videoId) }
+                if (filtered.isNotEmpty()) {
+                    val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
+                    group.title = if (title.contains("✦")) title else "$title ✦"
+                    // Set a dummy nextPageKey so GridFragmentHelper.canMergeWithGroup() won't merge
+                    // this row with other discovery rows (merging strips the title)
+                    group.nextPageKey = "discovery_${title.hashCode()}"
+                    group.mediaItems = java.util.ArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>(filtered)
+                    onGroupReady.accept(group)
+                    filtered.forEach { shownVideoIds.add(it.videoId) }
+                }
+            }
+        }
+
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
-        // 1. YouTube Charts (fast) — fallback to kworb if Charts fails
+        // 1. YouTube Charts — fallback to kworb if Charts fails
         futures.add(executor.submit {
             try {
                 val chartSeenIds = mutableSetOf<String>()
-                fetchYouTubeCharts(MediaGroup.TYPE_HOME, chartSeenIds, excluded) { group ->
-                    addToPool(group?.mediaItems)
+                if (unifiedShelf) {
+                    fetchYouTubeCharts(MediaGroup.TYPE_HOME, chartSeenIds, excluded) { group -> addToPool(group?.mediaItems) }
+                } else {
+                    fetchYouTubeCharts(MediaGroup.TYPE_HOME, chartSeenIds, excluded) { group ->
+                        if (group != null) {
+                            (group as? YouTubeMediaGroup)?.let { g ->
+                                val t = g.title ?: "Charts"
+                                g.title = if (t.contains("✦")) t else "$t ✦"
+                                g.nextPageKey = "discovery_charts_${g.title.hashCode()}"
+                            }
+                            onGroupReady.accept(group)
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 Log.d(TAG, "[PERF] Charts failed: ${e.message}")
-                try { addToPool(fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)?.mediaItems) }
-                catch (_: Exception) {}
+                try {
+                    val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)
+                    if (unifiedShelf) { addToPool(kworb?.mediaItems) } else if (kworb != null) {
+                        (kworb as? YouTubeMediaGroup)?.let { val t1 = it.title ?: "Trending"; it.title = if (t1.contains("✦")) t1 else "$t1 ✦"; it.nextPageKey = "discovery_kworb1" }
+                        onGroupReady.accept(kworb)
+                    }
+                } catch (_: Exception) {}
             }
         })
 
-        // 2. kworb trending (runs in parallel with Charts — both contribute to pool)
-        futures.add(executor.submit {
-            try { addToPool(fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)?.mediaItems) }
-            catch (_: Exception) {}
-        })
-
-        // 3. Language discovery
+        // 2. kworb trending
         futures.add(executor.submit {
             try {
-                searchSemaphore.acquire()
-                val word = getLanguageStopWord()
-                Log.d(TAG, "[PERF] language discovery: searching '$word'")
-                val sr = searchFresh(word)
-                searchSemaphore.release()
-                val groups = YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)
-                val items = groups?.firstOrNull()?.mediaItems
-                Log.d(TAG, "[PERF] language discovery: ${items?.size ?: 0} items from ${groups?.size ?: 0} groups")
-                addToPool(items)
-            } catch (e: Exception) { searchSemaphore.release(); Log.d(TAG, "[PERF] language discovery failed: ${e.message}") }
+                val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)
+                if (unifiedShelf) { addToPool(kworb?.mediaItems) } else if (kworb != null) {
+                    (kworb as? YouTubeMediaGroup)?.let { val t2 = it.title ?: "Trending"; it.title = if (t2.contains("✦")) t2 else "$t2 ✦"; it.nextPageKey = "discovery_kworb2" }
+                    onGroupReady.accept(kworb)
+                }
+            } catch (_: Exception) {}
         })
+
+        // 3. Language discovery (if enabled)
+        if (languageDiscoveryEnabled) {
+            futures.add(executor.submit {
+                try {
+                    searchSemaphore.acquire()
+                    val items = searchFreshItems(getLanguageStopWord())
+                    searchSemaphore.release()
+                    if (unifiedShelf) { addToPool(items) } else { emitSeparate(languageDiscoveryTitle, items) }
+                } catch (e: Exception) { searchSemaphore.release() }
+            })
+        }
 
         // Wait for fast sources (Charts + kworb + language)
         for (f in futures) { try { f.get(15, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
 
-        // 4. Search queries (MEDIUM + HARD) — grow pool with diverse content
-        Log.d(TAG, "[PERF] refresh level=$level, running search: ${level >= REFRESH_MEDIUM}")
+        // 4. Search queries (MEDIUM + HARD)
         if (level >= REFRESH_MEDIUM) {
-            val queries = getRotatedHomeQueries()
-            Log.d(TAG, "[PERF] search queries: ${queries.size} — ${queries.map { it.second }}")
-            val searchFutures = queries.map { (_, query) ->
+            val allQueries = when {
+                // All expanded: all enabled pools
+                allPoolsAtOnce && homeQueryPools.isNotEmpty() -> homeQueryPools.flatten()
+                // Rotating: N pools per refresh (cycling through)
+                rotatingPoolCount > 0 && homeQueryPools.isNotEmpty() -> {
+                    val idx = refreshCounter.getAndIncrement() % homeQueryPools.size
+                    val selected = mutableListOf<Pair<String, String>>()
+                    for (i in 0 until rotatingPoolCount) {
+                        selected.addAll(homeQueryPools[(idx + i) % homeQueryPools.size])
+                    }
+                    Log.d(TAG, "[PERF] rotating: pools ${idx} and ${(idx+1) % homeQueryPools.size} (counter=${refreshCounter.get()})")
+                    selected
+                }
+                // Unified: 1 rotated pool
+                else -> getRotatedHomeQueries()
+            }
+            Log.d(TAG, "[PERF] search: ${allQueries.size} queries, allPools=$allPoolsAtOnce")
+            val searchFutures = allQueries.map { (title, query) ->
                 executor.submit {
                     try {
                         searchSemaphore.acquire()
                         Thread.sleep(jitterMs.toLong() + random.nextInt(jitterMs))
-                        Log.d(TAG, "[PERF] searching: '$query'")
-                        val sr = searchFresh(query)
+                        val items = searchFreshItems(query)
                         searchSemaphore.release()
-                        val groups = YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)
-                        val items = groups?.firstOrNull()?.mediaItems
-                        Log.d(TAG, "[PERF] search '$query': ${items?.size ?: 0} items")
-                        addToPool(items)
-                    } catch (e: Exception) { searchSemaphore.release(); Log.d(TAG, "[PERF] search '$query' failed: ${e.message}") }
+                        Log.d(TAG, "[PERF] search '$query': ${items.size} items")
+                        if (unifiedShelf) { addToPool(items) } else { emitSeparate(title, items) }
+                    } catch (e: Exception) { searchSemaphore.release() }
                 }
             }
             for (f in searchFutures) { try { f.get(20, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
@@ -284,9 +358,9 @@ internal open class BrowseService2 {
 
         executor.shutdown()
 
-        // Save fresh pool to cache. Only emit if cache wasn't already shown
-        // (avoids duplicate "For You ✦" row that triggers content disappearance).
-        if (pool.size >= MIN_POOL_SIZE) {
+        // Unified mode: save to cache + emit if cache wasn't already shown
+        // Separate mode: already emitted per-source above, just save cache
+        if (unifiedShelf && pool.size >= MIN_POOL_SIZE) {
             cachedPoolJson = serializePool(pool.toList())
             cachedPoolTimestamp = System.currentTimeMillis()
             if (!cacheAlreadyEmitted) {
@@ -299,6 +373,11 @@ internal open class BrowseService2 {
             } else {
                 Log.d(TAG, "[PERF] pool saved to cache: ${pool.size} items (cache already visible)")
             }
+        } else if (!unifiedShelf && pool.size >= MIN_POOL_SIZE) {
+            // Save cache even in separate mode (for switching back to unified later)
+            cachedPoolJson = serializePool(pool.toList())
+            cachedPoolTimestamp = System.currentTimeMillis()
+            Log.d(TAG, "[PERF] separate shelves: ${pool.size} items emitted individually, cache saved")
         }
 
         lastFullRefreshMs = System.currentTimeMillis()
@@ -385,9 +464,13 @@ internal open class BrowseService2 {
         // 1. First query: sequential (warms up TLS + connection pool)
         val first = queries.first()
         val t1 = System.currentTimeMillis()
-        val firstResult = searchFresh(first.second)
+        val firstGroup = searchFresh(first.second)
         Log.d(TAG, "[PERF] first search '${first.second}' took ${System.currentTimeMillis() - t1}ms (warmup)")
-        addSearchResult(firstResult, first.first, groupType, result, seenIds, excluded)
+        firstGroup?.let { group ->
+            (group as? YouTubeMediaGroup)?.title = first.first
+            group.mediaItems?.removeAll { item -> val id = item?.videoId ?: return@removeAll false; !seenIds.add(id) || excluded.contains(id) }
+            if (group.isEmpty != true) result.add(group)
+        }
 
         // 2. Remaining queries + kworb trending: parallel
         val remaining = queries.drop(1).toMutableList()
@@ -396,15 +479,19 @@ internal open class BrowseService2 {
             val futures = remaining.map { (title, query) ->
                 executor.submit(java.util.concurrent.Callable {
                     val tq = System.currentTimeMillis()
-                    val sr = searchFresh(query)
+                    val group = searchFresh(query)
                     Log.d(TAG, "[PERF] parallel search '$query' took ${System.currentTimeMillis() - tq}ms")
-                    Pair(title, sr)
+                    Pair(title, group)
                 })
             }
             for (future in futures) {
                 try {
-                    val (title, sr) = future.get(10, java.util.concurrent.TimeUnit.SECONDS)
-                    addSearchResult(sr, title, groupType, result, seenIds, excluded)
+                    val (title, group) = future.get(10, java.util.concurrent.TimeUnit.SECONDS)
+                    group?.let {
+                        (it as? YouTubeMediaGroup)?.title = title
+                        it.mediaItems?.removeAll { item -> val id = item?.videoId ?: return@removeAll false; !seenIds.add(id) || excluded.contains(id) }
+                        if (it.isEmpty != true) result.add(it)
+                    }
                 } catch (e: Exception) {
                     Log.d(TAG, "[PERF] search failed: ${e.message}")
                 }
@@ -931,18 +1018,12 @@ internal open class BrowseService2 {
         val excluded = excludedVideoIds
         for ((title, query) in queries) {
             val tq = System.currentTimeMillis()
-            val searchResult = searchFresh(query)
-            Log.d(TAG, "[PERF]search '$query' took ${System.currentTimeMillis() - tq}ms")
-            searchResult?.let {
-                val groups = YouTubeMediaGroup.from(it, groupType)
-                groups?.firstOrNull()?.let { group ->
-                    (group as? YouTubeMediaGroup)?.title = title
-                    group.mediaItems?.removeAll { item ->
-                        val id = item?.videoId ?: return@removeAll false
-                        !seenIds.add(id) || excluded.contains(id)
-                    }
-                    if (group.isEmpty != true) result.add(group)
-                }
+            val group = searchFresh(query)
+            Log.d(TAG, "[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
+            group?.let {
+                (it as? YouTubeMediaGroup)?.title = title
+                it.mediaItems?.removeAll { item -> val id = item?.videoId ?: return@removeAll false; !seenIds.add(id) || excluded.contains(id) }
+                if (it.isEmpty != true) result.add(it)
             }
         }
         return result
@@ -985,6 +1066,25 @@ internal open class BrowseService2 {
 
         @JvmStatic @Volatile
         var discoveryTitle: String = "For You ✦"
+
+        @JvmStatic @Volatile
+        var languageDiscoveryTitle: String = "Language Discovery ✦"
+
+        /** When false, emit each source as separate shelf instead of unified pool */
+        @JvmStatic @Volatile
+        var unifiedShelf: Boolean = true
+
+        /** When true, load all 5 pools at once instead of rotating */
+        @JvmStatic @Volatile
+        var allPoolsAtOnce: Boolean = false
+
+        /** When > 0, show this many pools per refresh (rotating mode) */
+        @JvmStatic @Volatile
+        var rotatingPoolCount: Int = 0
+
+        /** Whether to run language stop word search */
+        @JvmStatic @Volatile
+        var languageDiscoveryEnabled: Boolean = true
 
         /** Increments on each home refresh to rotate query pools */
         @JvmStatic
@@ -1119,10 +1219,7 @@ internal open class BrowseService2 {
     fun prefetchForHome(queries: List<Pair<String, String>>) {
         val maxPerChannel = MAX_PREFETCH_PER_CHANNEL
         for ((title, query) in queries) {
-            val searchResult = searchFresh(query) ?: continue
-
-            val groups = YouTubeMediaGroup.from(searchResult, MediaGroup.TYPE_HOME) ?: continue
-            val group = groups.firstOrNull() ?: continue
+            val group = searchFresh(query) ?: continue
             (group as? YouTubeMediaGroup)?.title = "$title ✦"
 
             // Filter: no dupes, no watched, limit per creator

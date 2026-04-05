@@ -265,25 +265,40 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
-            // Emit cached "For You ✦" FIRST (instant, before any network call)
+            // Emit cached pool FIRST (unified mode only, instant)
             getBrowseService2().emitCachedPool(group -> {
                 if (group != null && !group.isEmpty()) {
                     emitter.onNext(java.util.Collections.singletonList(group));
                 }
             });
 
-            // Phase 1: TV client recommendations (~1-3s)
-            kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
-            if (fast != null && fast.getFirst() != null && !fast.getFirst().isEmpty()) {
-                emitter.onNext(fast.getFirst());
-            }
+            // Run Phase 1 (TV default) and Phase 2 (discovery) in parallel.
+            // Collect results, emit discovery first then TV default.
+            final java.util.List<MediaGroup>[] tvGroups = new java.util.List[]{null};
+            final java.util.List<MediaGroup> discoveryGroups =
+                    java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
-            // Phase 2: fresh "For You ✦" — Charts + kworb + search (replaces cache via ACTION_REPLACE)
+            // Phase 1 in background thread
+            Thread tvThread = new Thread(() -> {
+                kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
+                if (fast != null && fast.getFirst() != null) tvGroups[0] = fast.getFirst();
+            });
+            tvThread.start();
+
+            // Phase 2: discovery (Charts + kworb + search)
             getBrowseService2().streamHomeExtra(group -> {
                 if (group != null && !group.isEmpty()) {
+                    discoveryGroups.add(group);
+                    // Emit discovery shelves immediately (before TV default)
                     emitter.onNext(java.util.Collections.singletonList(group));
                 }
             });
+
+            // Wait for TV default to finish, then emit after discovery
+            try { tvThread.join(10_000); } catch (InterruptedException ignored) {}
+            if (tvGroups[0] != null && !tvGroups[0].isEmpty()) {
+                emitter.onNext(tvGroups[0]);
+            }
 
             emitter.onComplete();
         });
@@ -327,13 +342,13 @@ class YouTubeContentService implements ContentService {
             if (!hasContent && seenIds.isEmpty()) {
                 try {
                     String stopWord = getBrowseService2().getLanguageStopWordPublic();
-                    com.liskovsoft.youtubeapi.search.models.SearchResult sr =
+                    java.util.List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem> items =
                         getBrowseService2().searchFreshPublic(stopWord);
-                    if (sr != null) {
-                        java.util.List<MediaGroup> groups = com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup.from(sr, MediaGroup.TYPE_TRENDING);
-                        if (groups != null && !groups.isEmpty()) {
-                            emitter.onNext(groups);
-                        }
+                    if (items != null && !items.isEmpty()) {
+                        com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup group =
+                            new com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup(MediaGroup.TYPE_TRENDING);
+                        group.setMediaItems(new java.util.ArrayList<>(items));
+                        emitter.onNext(java.util.Collections.singletonList(group));
                     }
                 } catch (Exception e) {
                     // All sources failed
