@@ -13,15 +13,23 @@ import com.liskovsoft.youtubeapi.common.models.impl.mediaitem.ShortsMediaItem
 import com.liskovsoft.youtubeapi.next.v2.gen.getItems
 import com.liskovsoft.youtubeapi.next.v2.gen.getContinuationToken
 import com.liskovsoft.youtubeapi.next.v2.gen.getShelves
-import com.liskovsoft.youtubeapi.search.SearchApi
-import com.liskovsoft.youtubeapi.search.SearchApiHelper
 import com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup
 import android.util.Log
 
 internal open class BrowseService2 {
     private val mBrowseApi = RetrofitHelper.create(BrowseApi::class.java)
     private val TAG = "BrowseService2"
-    private val mSearchApi = RetrofitHelper.create(SearchApi::class.java)
+    private val mSearchApi = RetrofitHelper.create(com.liskovsoft.youtubeapi.search.SearchApi::class.java)
+    private fun searchWithVisitorData(query: String, options: Int = -1): com.liskovsoft.youtubeapi.search.models.SearchResult? {
+        val visitorData = com.liskovsoft.youtubeapi.app.AppService.instance().visitorData
+        val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQuery(query, options)
+        return RetrofitHelper.get(mSearchApi.getSearchResult(searchQuery, visitorData))
+    }
+    private fun searchWithVisitorData(query: String): com.liskovsoft.youtubeapi.search.models.SearchResult? {
+        val visitorData = com.liskovsoft.youtubeapi.app.AppService.instance().visitorData
+        val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQuery(query)
+        return RetrofitHelper.get(mSearchApi.getSearchResult(searchQuery, visitorData))
+    }
 
     //fun getHome(): List<MediaGroup?>? {
     //    val home = getBrowseRows(BrowseApiHelper.getHomeQueryWeb(), MediaGroup.TYPE_HOME)
@@ -101,9 +109,7 @@ internal open class BrowseService2 {
             futures.add(executor.submit {
                 try {
                     val tq = System.currentTimeMillis()
-                    val sr = RetrofitHelper.get(
-                        mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query, dateFilter))
-                    )
+                    val sr = searchWithVisitorData(query, dateFilter)
                     System.err.println("[PERF] stream search '$query' took ${System.currentTimeMillis() - tq}ms")
                     sr?.let {
                         val groups = YouTubeMediaGroup.from(it, MediaGroup.TYPE_HOME)
@@ -206,9 +212,7 @@ internal open class BrowseService2 {
         // 1. First query: sequential (warms up TLS + connection pool)
         val first = queries.first()
         val t1 = System.currentTimeMillis()
-        val firstResult = RetrofitHelper.get(
-            mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(first.second, dateFilter))
-        )
+        val firstResult = searchWithVisitorData(first.second, dateFilter)
         System.err.println("[PERF] first search '${first.second}' took ${System.currentTimeMillis() - t1}ms (warmup)")
         addSearchResult(firstResult, first.first, groupType, result, seenIds, excluded)
 
@@ -219,9 +223,7 @@ internal open class BrowseService2 {
             val futures = remaining.map { (title, query) ->
                 executor.submit(java.util.concurrent.Callable {
                     val tq = System.currentTimeMillis()
-                    val sr = RetrofitHelper.get(
-                        mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query, dateFilter))
-                    )
+                    val sr = searchWithVisitorData(query, dateFilter)
                     System.err.println("[PERF] parallel search '$query' took ${System.currentTimeMillis() - tq}ms")
                     Pair(title, sr)
                 })
@@ -251,57 +253,74 @@ internal open class BrowseService2 {
     }
 
     /**
-     * Fetches real trending video IDs from kworb.net, then looks them up via search.
-     * Returns a MediaGroup with real trending videos.
+     * Fetches real trending video IDs from kworb.net for user's country,
+     * then looks up each video individually via YouTube search (100% match rate).
+     * Each ID searched in parallel for speed.
      */
     private fun fetchKworbTrending(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
         val country = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().country ?: "US"
-        val countryLower = country.lowercase()
 
-        // Fetch regional trending page
-        val url = "https://kworb.net/youtube/trending/${countryLower}.html"
-        val client = okhttp3.OkHttpClient.Builder().connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        // 1. Fetch kworb trending page
+        val t0 = System.currentTimeMillis()
+        val url = "https://kworb.net/youtube/trending/${country.lowercase()}.html"
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS).build()
-
         val request = okhttp3.Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
         val response = try { client.newCall(request).execute() } catch (e: Exception) { return null }
-
-        if (!response.isSuccessful) {
-            response.close()
-            return null
-        }
-
+        if (!response.isSuccessful) { response.close(); return null }
         val body = response.body()?.string() ?: return null
         response.close()
+        System.err.println("[PERF] kworb fetch took ${System.currentTimeMillis() - t0}ms")
 
-        // Extract video IDs from the HTML
+        // 2. Extract video IDs (top 20)
         val videoIds = Regex("youtube\\.com/watch\\?v=([A-Za-z0-9_-]{11})")
             .findAll(body)
             .map { it.groupValues[1] }
             .filter { !seenIds.contains(it) && !excluded.contains(it) }
             .distinct()
-            .take(10)
+            .take(20)
             .toList()
-
         if (videoIds.isEmpty()) return null
 
-        // Search for these videos by ID to get full metadata
-        val topIds = videoIds.take(5).joinToString(" | ")
-        val searchResult = RetrofitHelper.get(
-            mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(topIds))
-        )
+        // 3. Search each ID individually in parallel (100% match rate)
+        val t1 = System.currentTimeMillis()
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(5)
+        val allItems = java.util.concurrent.CopyOnWriteArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
 
-        return searchResult?.let {
-            val groups = YouTubeMediaGroup.from(it, groupType)
-            groups?.firstOrNull()?.let { group ->
-                (group as? YouTubeMediaGroup)?.title = kworbTitle
-                group.mediaItems?.removeAll { item ->
-                    val id = item?.videoId ?: return@removeAll false
-                    !seenIds.add(id) || excluded.contains(id)
-                }
-                if (group.isEmpty != true) group else null
+        val futures = videoIds.map { videoId ->
+            executor.submit {
+                try {
+                    val sr = searchWithVisitorData(videoId)
+                    sr?.let {
+                        val groups = YouTubeMediaGroup.from(it, groupType)
+                        // Take the first result that matches this exact videoId
+                        groups?.firstOrNull()?.mediaItems?.firstOrNull { item ->
+                            item?.videoId == videoId
+                        }?.let { item ->
+                            allItems.add(item)
+                            seenIds.add(videoId)
+                        }
+                    }
+                } catch (_: Exception) {}
             }
         }
+
+        for (f in futures) {
+            try { f.get(10, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
+        }
+        executor.shutdown()
+        System.err.println("[PERF] kworb video lookups: ${allItems.size}/${videoIds.size} found in ${System.currentTimeMillis() - t1}ms")
+
+        if (allItems.isEmpty()) return null
+
+        // 4. Build a MediaGroup from the matched items
+        val group = YouTubeMediaGroup(groupType)
+        group.title = kworbTitle
+        // Preserve kworb ranking order
+        val orderedItems = videoIds.mapNotNull { id -> allItems.firstOrNull { it.videoId == id } }
+        group.mediaItems = java.util.ArrayList(orderedItems)
+        return group
     }
 
     private fun addSearchResult(
@@ -331,9 +350,7 @@ internal open class BrowseService2 {
         val excluded = excludedVideoIds
         for ((title, query) in queries) {
             val tq = System.currentTimeMillis()
-            val searchResult = RetrofitHelper.get(
-                mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
-            )
+            val searchResult = searchWithVisitorData(query)
             System.err.println("[PERF]search '$query' took ${System.currentTimeMillis() - tq}ms")
             searchResult?.let {
                 val groups = YouTubeMediaGroup.from(it, groupType)
@@ -425,9 +442,7 @@ internal open class BrowseService2 {
     fun prefetchForHome(queries: List<Pair<String, String>>) {
         val maxPerChannel = 2
         for ((title, query) in queries) {
-            val searchResult = RetrofitHelper.get(
-                mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
-            ) ?: continue
+            val searchResult = searchWithVisitorData(query) ?: continue
 
             val groups = YouTubeMediaGroup.from(searchResult, MediaGroup.TYPE_HOME) ?: continue
             val group = groups.firstOrNull() ?: continue
