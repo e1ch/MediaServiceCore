@@ -371,7 +371,7 @@ internal open class BrowseService2 {
             val futures = remaining.map { (title, query) ->
                 executor.submit(java.util.concurrent.Callable {
                     val tq = System.currentTimeMillis()
-                    val sr = searchWithVisitorData(query)
+                    val sr = searchWithVisitorData(query, dateFilter)
                     System.err.println("[PERF] parallel search '$query' took ${System.currentTimeMillis() - tq}ms")
                     Pair(title, sr)
                 })
@@ -915,7 +915,7 @@ internal open class BrowseService2 {
         val excluded = excludedVideoIds
         for ((title, query) in queries) {
             val tq = System.currentTimeMillis()
-            val searchResult = searchWithVisitorData(query)
+            val searchResult = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK)
             System.err.println("[PERF]search '$query' took ${System.currentTimeMillis() - tq}ms")
             searchResult?.let {
                 val groups = YouTubeMediaGroup.from(it, groupType)
@@ -1037,7 +1037,7 @@ internal open class BrowseService2 {
     fun prefetchForHome(queries: List<Pair<String, String>>) {
         val maxPerChannel = 2
         for ((title, query) in queries) {
-            val searchResult = searchWithVisitorData(query) ?: continue
+            val searchResult = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK) ?: continue
 
             val groups = YouTubeMediaGroup.from(searchResult, MediaGroup.TYPE_HOME) ?: continue
             val group = groups.firstOrNull() ?: continue
