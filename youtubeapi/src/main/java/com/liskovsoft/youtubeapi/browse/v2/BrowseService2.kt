@@ -148,17 +148,17 @@ internal open class BrowseService2 {
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         val level = getRefreshLevel()
 
-        // If cache is valid, emit it instantly (no network needed)
+        // If cache is valid and refresh is soft, emit cached pool and return (no network needed)
         if (isPoolCacheValid() && cachedPoolJson != null) {
             val cached = deserializePool(cachedPoolJson!!)
-            if (cached.size >= 3) {
+            if (cached.size >= 3 && level == REFRESH_SOFT) {
                 val shuffled = cached.toMutableList().apply { shuffle(java.util.Random()) }
                 val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
                 group.title = discoveryTitle
                 group.mediaItems = java.util.ArrayList(shuffled)
                 onGroupReady.accept(group)
                 System.err.println("[PERF] pool cache hit: ${cached.size} items (age: ${(System.currentTimeMillis() - cachedPoolTimestamp)/1000}s)")
-                if (level == REFRESH_SOFT) return // cache is fresh enough
+                return // cache is fresh enough
             }
         }
 
