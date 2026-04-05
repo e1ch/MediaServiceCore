@@ -141,137 +141,98 @@ internal open class BrowseService2 {
      * kworb also runs in parallel alongside search queries.
      */
     /**
-     * Streaming Phase 2:
-     * - kworb runs immediately (uses /player, fast, no rate limit risk)
-     * - search queries use semaphore (max 2 concurrent) + jitter to avoid rate limiting
-     * - each result emitted as soon as ready
+     * Phase 2: unified pool — ALL sources mixed into one "For You" shelf.
+     * No per-category display. Content shuffled randomly, grows progressively.
+     * Charts/kworb arrive first → emit. Search results added → re-emit with more items.
      */
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         val level = getRefreshLevel()
-        System.err.println("[PERF] refresh level: ${when(level) { REFRESH_SOFT -> "SOFT" ; REFRESH_MEDIUM -> "MEDIUM"; else -> "HARD" }}")
+        if (level == REFRESH_SOFT) return
 
-        if (level == REFRESH_SOFT) {
-            // Soft refresh: Phase 1 only, skip all network calls
-            return
-        }
-
-        val queries = getRotatedHomeQueries()
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val excluded = excludedVideoIds
         val random = java.util.Random()
+        val pool = java.util.concurrent.CopyOnWriteArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
 
-        // QoS: reduce concurrency when video is playing
-        val maxConcurrent = if (YouTubeMediaGroup.isPlaybackActive()) 1 else 3
-        val jitterMs = if (YouTubeMediaGroup.isPlaybackActive()) 800 else 200
+        val playbackActive = YouTubeMediaGroup.isPlaybackActive()
+        val maxConcurrent = if (playbackActive) 1 else 3
+        val jitterMs = if (playbackActive) 800 else 200
         val executor = java.util.concurrent.Executors.newFixedThreadPool(maxConcurrent) { r ->
             Thread(r).apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
         }
-        val searchSemaphore = java.util.concurrent.Semaphore(if (YouTubeMediaGroup.isPlaybackActive()) 1 else 2)
+        val searchSemaphore = java.util.concurrent.Semaphore(if (playbackActive) 1 else 2)
+
+        // Helper: add items to unified pool, dedup, emit shuffled snapshot
+        val addAndEmit = { items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
+            items?.forEach { item ->
+                val id = item.videoId ?: return@forEach
+                if (seenIds.add(id) && !excluded.contains(id)) {
+                    pool.add(item)
+                    shownVideoIds.add(id)
+                }
+            }
+            if (pool.size >= 3) {
+                val shuffled = pool.toMutableList().apply { shuffle(random) }
+                val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
+                group.title = discoveryTitle
+                group.mediaItems = java.util.ArrayList(shuffled)
+                onGroupReady.accept(group)
+            }
+        }
+
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
-        // YouTube Charts: official trending data (1 API call, full metadata)
-        // Falls back to kworb if Charts unavailable
+        // 1. YouTube Charts (fast)
         futures.add(executor.submit {
             try {
-                val t0 = System.currentTimeMillis()
                 fetchYouTubeCharts(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded) { group ->
-                    group?.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
-                    onGroupReady.accept(group)
+                    addAndEmit(group?.mediaItems)
                 }
-                System.err.println("[PERF] YouTube Charts done: ${System.currentTimeMillis() - t0}ms")
-            } catch (e: Exception) {
-                // Fallback to kworb
-                System.err.println("[PERF] Charts failed, trying kworb: ${e.message}")
+            } catch (_: Exception) {
                 try {
                     val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
-                    if (kworb != null) {
-                        kworb.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
-                        onGroupReady.accept(kworb)
-                    }
+                    addAndEmit(kworb?.mediaItems)
                 } catch (_: Exception) {}
             }
         })
 
-        // Language discovery: search with stop words + sort by upload date
-        // Returns diverse, fresh, language-specific content with "新影片" badge
+        // 2. Language discovery
         futures.add(executor.submit {
             try {
                 searchSemaphore.acquire()
-                val stopWord = getLanguageStopWord()
-                val tq = System.currentTimeMillis()
-                // CAI= = sort by upload date → triggers "新影片" badge
-                val sr = searchFresh(stopWord)
-                System.err.println("[PERF] language discovery '$stopWord' took ${System.currentTimeMillis() - tq}ms")
+                val sr = searchFresh(getLanguageStopWord())
                 searchSemaphore.release()
-
-                sr?.let {
-                    val groups = YouTubeMediaGroup.from(it, MediaGroup.TYPE_HOME)
-                    groups?.firstOrNull()?.let { group ->
-                        (group as? YouTubeMediaGroup)?.title = discoveryTitle
-                        group.mediaItems?.removeAll { item ->
-                            val id = item?.videoId ?: return@removeAll false
-                            !seenIds.add(id) || excluded.contains(id)
-                        }
-                        val mediaItems = group.mediaItems
-                        if (mediaItems != null && mediaItems.size >= 3) {
-                            mediaItems.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
-                            onGroupReady.accept(group)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                searchSemaphore.release()
-            }
+                val groups = YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)
+                addAndEmit(groups?.firstOrNull()?.mediaItems)
+            } catch (_: Exception) { searchSemaphore.release() }
         })
 
-        // Search queries: only on HARD refresh
-        if (level < REFRESH_HARD || queries.isEmpty()) {
-            for (f in futures) { try { f.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
-            executor.shutdown()
-            lastFullRefreshMs = System.currentTimeMillis()
-            return
-        }
+        // Wait for fast sources
+        for (f in futures) { try { f.get(15, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
 
-        for ((title, query) in queries) {
-            futures.add(executor.submit {
-                try {
-                    searchSemaphore.acquire()
-                    // Jitter: adaptive delay (longer when video is playing)
-                    Thread.sleep(jitterMs.toLong() + random.nextInt(jitterMs))
-                    val tq = System.currentTimeMillis()
-                    val sr = searchFresh(query)
-                    System.err.println("[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
-                    searchSemaphore.release()
-
-                    sr?.let {
-                        val groups = YouTubeMediaGroup.from(it, MediaGroup.TYPE_HOME)
-                        groups?.firstOrNull()?.let { group ->
-                            (group as? YouTubeMediaGroup)?.title = title
-                            group.mediaItems?.removeAll { item ->
-                                val id = item?.videoId ?: return@removeAll false
-                                !seenIds.add(id) || excluded.contains(id)
-                            }
-                            // Only show groups with 3+ items (avoid "only 1-2 videos" shelves)
-                            val mediaItems = group.mediaItems
-                            if (mediaItems != null && mediaItems.size >= 3) {
-                                group.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
-                                onGroupReady.accept(group)
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    searchSemaphore.release()
-                    System.err.println("[PERF] search failed: ${e.message}")
+        // 3. Search queries (HARD only) — progressively grow the pool
+        if (level >= REFRESH_HARD) {
+            val queries = getRotatedHomeQueries()
+            val searchFutures = queries.map { (_, query) ->
+                executor.submit {
+                    try {
+                        searchSemaphore.acquire()
+                        Thread.sleep(jitterMs.toLong() + random.nextInt(jitterMs))
+                        val sr = searchFresh(query)
+                        searchSemaphore.release()
+                        val groups = YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)
+                        addAndEmit(groups?.firstOrNull()?.mediaItems)
+                    } catch (_: Exception) { searchSemaphore.release() }
                 }
-            })
+            }
+            for (f in searchFutures) { try { f.get(20, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
         }
 
-        for (f in futures) {
-            try { f.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
-        }
         executor.shutdown()
         lastFullRefreshMs = System.currentTimeMillis()
     }
+
+
 
     /** Legacy single-call (used by non-Observable getHome in YouTubeContentService) */
     fun getHome(): Pair<List<MediaGroup?>?, String?>? {
