@@ -33,6 +33,21 @@ internal open class BrowseService2 {
         call.request()?.let { RetrofitOkHttpHelper.addAuthSkip(it) }
         return RetrofitHelper.get(call)
     }
+    /**
+     * Search THIS_WEEK first (triggers 新影片 badge).
+     * If < 3 results, fallback to THIS_MONTH for more content.
+     */
+    private fun searchFresh(query: String): com.liskovsoft.youtubeapi.search.models.SearchResult? {
+        val week = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK
+        val month = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH
+        var sr = searchWithVisitorData(query, week)
+        val count = sr?.sections?.firstOrNull()?.itemWrappers?.size ?: 0
+        if (count < 3) {
+            sr = searchWithVisitorData(query, month)
+        }
+        return sr
+    }
+
     private fun searchWithVisitorData(query: String): com.liskovsoft.youtubeapi.search.models.SearchResult? {
         val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQuery(query)
         val call = mSearchApi.getSearchResult(searchQuery)
@@ -174,7 +189,7 @@ internal open class BrowseService2 {
                 val stopWord = getLanguageStopWord()
                 val tq = System.currentTimeMillis()
                 // CAI= = sort by upload date → triggers "新影片" badge
-                val sr = searchWithVisitorData(stopWord, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK)
+                val sr = searchFresh(stopWord)
                 System.err.println("[PERF] language discovery '$stopWord' took ${System.currentTimeMillis() - tq}ms")
                 searchSemaphore.release()
 
@@ -213,12 +228,7 @@ internal open class BrowseService2 {
                     // Jitter: 200-400ms random delay to spread requests
                     Thread.sleep(200L + random.nextInt(200))
                     val tq = System.currentTimeMillis()
-                    // Filter: THIS_WEEK first (triggers "新影片" badge), fallback THIS_MONTH
-                    var sr = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK)
-                    // If too few results this week, try this month
-                    if (sr == null || (sr.sections?.firstOrNull()?.itemWrappers?.size ?: 0) < 3) {
-                        sr = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH)
-                    }
+                    val sr = searchFresh(query)
                     System.err.println("[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
                     searchSemaphore.release()
 
@@ -350,9 +360,6 @@ internal open class BrowseService2 {
     fun getSearchFallbackParallel(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
         if (queries.isEmpty()) return emptyList()
 
-        // Use "This Week" filter — triggers "新影片" badge on results
-        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK
-
         val result = mutableListOf<MediaGroup?>()
         val seenIds = mutableSetOf<String>()
         val excluded = excludedVideoIds
@@ -360,7 +367,7 @@ internal open class BrowseService2 {
         // 1. First query: sequential (warms up TLS + connection pool)
         val first = queries.first()
         val t1 = System.currentTimeMillis()
-        val firstResult = searchWithVisitorData(first.second, dateFilter)
+        val firstResult = searchFresh(first.second)
         System.err.println("[PERF] first search '${first.second}' took ${System.currentTimeMillis() - t1}ms (warmup)")
         addSearchResult(firstResult, first.first, groupType, result, seenIds, excluded)
 
@@ -371,7 +378,7 @@ internal open class BrowseService2 {
             val futures = remaining.map { (title, query) ->
                 executor.submit(java.util.concurrent.Callable {
                     val tq = System.currentTimeMillis()
-                    val sr = searchWithVisitorData(query, dateFilter)
+                    val sr = searchFresh(query)
                     System.err.println("[PERF] parallel search '$query' took ${System.currentTimeMillis() - tq}ms")
                     Pair(title, sr)
                 })
@@ -915,7 +922,7 @@ internal open class BrowseService2 {
         val excluded = excludedVideoIds
         for ((title, query) in queries) {
             val tq = System.currentTimeMillis()
-            val searchResult = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK)
+            val searchResult = searchFresh(query)
             System.err.println("[PERF]search '$query' took ${System.currentTimeMillis() - tq}ms")
             searchResult?.let {
                 val groups = YouTubeMediaGroup.from(it, groupType)
@@ -1037,7 +1044,7 @@ internal open class BrowseService2 {
     fun prefetchForHome(queries: List<Pair<String, String>>) {
         val maxPerChannel = 2
         for ((title, query) in queries) {
-            val searchResult = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK) ?: continue
+            val searchResult = searchFresh(query) ?: continue
 
             val groups = YouTubeMediaGroup.from(searchResult, MediaGroup.TYPE_HOME) ?: continue
             val group = groups.firstOrNull() ?: continue
