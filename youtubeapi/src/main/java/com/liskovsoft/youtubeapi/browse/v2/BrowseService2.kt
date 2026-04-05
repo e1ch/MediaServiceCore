@@ -357,33 +357,116 @@ internal open class BrowseService2 {
         return group
     }
 
-    /** Parse /player JSON into a YouTubeMediaItem for UI display */
+    /** Parse /player JSON into a YouTubeMediaItem with full metadata for UI display */
     private fun parsePlayerToVideo(json: String, videoId: String): com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem? {
         try {
             val obj = org.json.JSONObject(json)
             val vd = obj.optJSONObject("videoDetails") ?: return null
+            val mf = obj.optJSONObject("microformat")?.optJSONObject("playerMicroformatRenderer")
+
             val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
             item.videoId = vd.optString("videoId", videoId)
             item.title = vd.optString("title", "")
             item.author = vd.optString("author", "")
+
+            // Thumbnail (use highest quality)
             val thumbs = vd.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
             if (thumbs != null && thumbs.length() > 0) {
                 item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
             }
-            // durationMs is read-only in YouTubeMediaItem (computed from internal model)
+
+            // Second title: channel name · view count · upload time (displayed below title)
+            val author = vd.optString("author", "")
+            val viewCount = formatViewCount(vd.optString("viewCount", ""))
+            val publishDate = mf?.optString("publishDate", "") ?: ""
+            val timeAgo = if (publishDate.isNotEmpty()) formatTimeAgo(publishDate) else ""
+            item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(
+                author, viewCount, timeAgo
+            )
+
+            // Live badge
+            if (vd.optBoolean("isLiveContent", false) && vd.optBoolean("isLive", false)) {
+                item.isLive = true
+            }
+
             return item
         } catch (_: Exception) { return null }
     }
 
+    /** Format view count: 7598293 → "759萬次觀看" */
     private fun formatViewCount(count: String): String {
-        val n = count.toLongOrNull() ?: return count
+        val n = count.toLongOrNull() ?: return ""
+        if (n <= 0) return ""
+        val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
         return when {
-            n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}億次觀看"
-            n >= 10_000 -> "${n / 10_000}萬次觀看"
-            n >= 1000 -> "${n / 1000}千次觀看"
-            else -> "${n}次觀看"
+            lang.startsWith("zh") -> when {
+                n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}億次觀看"
+                n >= 10_000 -> "${n / 10_000}萬次觀看"
+                else -> "${n}次觀看"
+            }
+            lang.startsWith("ko") -> when {
+                n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}억회"
+                n >= 10_000 -> "${n / 10_000}만회"
+                else -> "${n}회"
+            }
+            lang.startsWith("ja") -> when {
+                n >= 100_000_000 -> "${n / 100_000_000}.${(n % 100_000_000) / 10_000_000}億回"
+                n >= 10_000 -> "${n / 10_000}万回"
+                else -> "${n}回"
+            }
+            else -> when {
+                n >= 1_000_000_000 -> "${n / 1_000_000_000}.${(n % 1_000_000_000) / 100_000_000}B views"
+                n >= 1_000_000 -> "${n / 1_000_000}.${(n % 1_000_000) / 100_000}M views"
+                n >= 1_000 -> "${n / 1_000}K views"
+                else -> "$n views"
+            }
         }
     }
+
+    /** Format ISO date to relative time: "2026-04-01T21:00:02-07:00" → "4 天前" */
+    private fun formatTimeAgo(isoDate: String): String {
+        try {
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+            val date = sdf.parse(isoDate.substring(0, 10)) ?: return ""
+            val diffMs = System.currentTimeMillis() - date.time
+            val days = diffMs / (24 * 60 * 60 * 1000)
+            val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
+            return when {
+                lang.startsWith("zh") -> when {
+                    days < 1 -> "今天"
+                    days < 2 -> "昨天"
+                    days < 7 -> "${days}天前"
+                    days < 30 -> "${days / 7}週前"
+                    days < 365 -> "${days / 30}個月前"
+                    else -> "${days / 365}年前"
+                }
+                lang.startsWith("ko") -> when {
+                    days < 1 -> "오늘"
+                    days < 7 -> "${days}일 전"
+                    days < 30 -> "${days / 7}주 전"
+                    days < 365 -> "${days / 30}개월 전"
+                    else -> "${days / 365}년 전"
+                }
+                lang.startsWith("ja") -> when {
+                    days < 1 -> "今日"
+                    days < 7 -> "${days}日前"
+                    days < 30 -> "${days / 7}週間前"
+                    days < 365 -> "${days / 30}か月前"
+                    else -> "${days / 365}年前"
+                }
+                else -> when {
+                    days < 1 -> "today"
+                    days < 2 -> "yesterday"
+                    days < 7 -> "$days days ago"
+                    days < 30 -> "${days / 7} weeks ago"
+                    days < 365 -> "${days / 30} months ago"
+                    else -> "${days / 365} years ago"
+                }
+            }
+        } catch (_: Exception) { return "" }
+    }
+
+
 
     private fun addSearchResult(
         searchResult: com.liskovsoft.youtubeapi.search.models.SearchResult?,
