@@ -241,7 +241,21 @@ internal open class BrowseService2 {
      * Uses search-based trending directly.
      */
     fun getTrending(): List<MediaGroup?>? {
-        return getSearchFallbackParallel(trendingQueries, MediaGroup.TYPE_TRENDING)
+        // Try YouTube Charts first (official trending data)
+        val result = mutableListOf<MediaGroup?>()
+        val seenIds = mutableSetOf<String>()
+        try {
+            fetchYouTubeCharts(MediaGroup.TYPE_TRENDING, seenIds, excludedVideoIds) { group ->
+                if (group != null) result.add(group)
+            }
+        } catch (_: Exception) {}
+
+        // Add search-based results for more variety
+        if (result.size < 3) {
+            result.addAll(getSearchFallbackParallel(trendingQueries, MediaGroup.TYPE_TRENDING))
+        }
+
+        return result.ifEmpty { null }
     }
 
     /**
@@ -346,58 +360,44 @@ internal open class BrowseService2 {
                 .getJSONObject("musicAnalyticsSectionRenderer").getJSONObject("content")
                 .getJSONArray("videos")
 
+            // Parse video charts (TOP_VIEWS + TRENDING)
             for (i in 0 until sections.length()) {
                 val chart = sections.getJSONObject(i)
                 val listType = chart.optString("listType", "")
                 val videoViews = chart.getJSONArray("videoViews")
 
                 val title = when (listType) {
-                    "TRENDING_CHART" -> kworbTitle  // reuse localized title
-                    "TOP_VIEWS_CHART" -> when {
-                        lang.startsWith("zh") -> "🏆 排行榜"
-                        lang.startsWith("ko") -> "🏆 차트"
-                        lang.startsWith("ja") -> "🏆 ランキング"
-                        else -> "🏆 Top Charts"
-                    }
+                    "TRENDING_CHART" -> kworbTitle
+                    "TOP_VIEWS_CHART" -> chartsTopTitle
                     else -> continue
                 }
 
-                val items = mutableListOf<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
-                val count = videoViews.length().coerceAtMost(20)
-
-                for (j in 0 until count) {
-                    val v = videoViews.getJSONObject(j)
-                    val videoId = v.optString("id", "")
-                    if (videoId.isEmpty() || seenIds.contains(videoId) || excluded.contains(videoId)) continue
-
-                    val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
-                    item.videoId = videoId
-                    item.title = v.optString("title", "")
-
-                    val artists = v.optJSONArray("artists")
-                    val artistName = if (artists != null && artists.length() > 0)
-                        artists.getJSONObject(0).optString("name", "") else ""
-                    item.author = artistName
-
-                    val thumbs = v.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
-                    if (thumbs != null && thumbs.length() > 0) {
-                        item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
-                    }
-
-                    val viewCount = v.optString("viewCount", "")
-                    item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(
-                        artistName, if (viewCount.isNotEmpty()) formatViewCount(viewCount) else ""
-                    )
-
-                    seenIds.add(videoId)
-                    items.add(item)
+                val group = parseChartVideoViews(videoViews, title, groupType, seenIds, excluded)
+                if (group != null) {
+                    onGroupReady?.accept(group) ?: return group
                 }
+            }
 
-                if (items.isNotEmpty()) {
-                    val group = YouTubeMediaGroup(groupType)
-                    group.title = title
-                    group.mediaItems = java.util.ArrayList(items)
-                    onGroupReady?.accept(group) ?: return group // return first group if no callback
+            // Parse songs chart (TOP_VIEWS — different from video chart, has encryptedVideoId)
+            val trackTypes = json.getJSONObject("contents").getJSONObject("sectionListRenderer")
+                .getJSONArray("contents").getJSONObject(0)
+                .getJSONObject("musicAnalyticsSectionRenderer").getJSONObject("content")
+                .optJSONArray("trackTypes")
+
+            if (trackTypes != null && trackTypes.length() > 0) {
+                val songChart = trackTypes.getJSONObject(0)
+                val trackViews = songChart.optJSONArray("trackViews")
+                if (trackViews != null) {
+                    val songTitle = when {
+                        lang.startsWith("zh") -> "🎵 熱門歌曲"
+                        lang.startsWith("ko") -> "🎵 인기곡"
+                        lang.startsWith("ja") -> "🎵 人気曲"
+                        else -> "🎵 Top Songs"
+                    }
+                    val group = parseChartTrackViews(trackViews, songTitle, groupType, seenIds, excluded)
+                    if (group != null) {
+                        onGroupReady?.accept(group) ?: return group
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -484,6 +484,67 @@ internal open class BrowseService2 {
         val group = YouTubeMediaGroup(groupType)
         group.title = kworbTitle
         group.mediaItems = java.util.ArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>(orderedItems)
+        return group
+    }
+
+    /** Parse video chart entries into a MediaGroup */
+    private fun parseChartVideoViews(videoViews: org.json.JSONArray, title: String, groupType: Int,
+                                     seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
+        val items = mutableListOf<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
+        val count = videoViews.length().coerceAtMost(20)
+        for (j in 0 until count) {
+            val v = videoViews.getJSONObject(j)
+            val videoId = v.optString("id", "")
+            if (videoId.isEmpty() || seenIds.contains(videoId) || excluded.contains(videoId)) continue
+
+            val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
+            item.videoId = videoId
+            item.title = v.optString("title", "")
+            val artists = v.optJSONArray("artists")
+            val artistName = if (artists != null && artists.length() > 0) artists.getJSONObject(0).optString("name", "") else ""
+            item.author = artistName
+            val thumbs = v.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+            if (thumbs != null && thumbs.length() > 0) item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
+            val vc = v.optString("viewCount", "")
+            item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(artistName, if (vc.isNotEmpty()) formatViewCount(vc) else "")
+            seenIds.add(videoId)
+            items.add(item)
+        }
+        if (items.isEmpty()) return null
+        val group = YouTubeMediaGroup(groupType)
+        group.title = title
+        group.mediaItems = java.util.ArrayList(items)
+        return group
+    }
+
+    /** Parse song/track chart entries into a MediaGroup (uses encryptedVideoId for thumbnail) */
+    private fun parseChartTrackViews(trackViews: org.json.JSONArray, title: String, groupType: Int,
+                                     seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
+        val items = mutableListOf<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
+        val count = trackViews.length().coerceAtMost(20)
+        for (j in 0 until count) {
+            val t = trackViews.getJSONObject(j)
+            // Songs use encryptedVideoId as the playable videoId
+            val videoId = t.optString("encryptedVideoId", "")
+            if (videoId.isEmpty() || seenIds.contains(videoId) || excluded.contains(videoId)) continue
+
+            val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
+            item.videoId = videoId
+            item.title = t.optString("name", "")
+            val artists = t.optJSONArray("artists")
+            val artistName = if (artists != null && artists.length() > 0) artists.getJSONObject(0).optString("name", "") else ""
+            item.author = artistName
+            val thumbs = t.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+            if (thumbs != null && thumbs.length() > 0) item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
+            val vc = t.optString("viewCount", "")
+            item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(artistName, if (vc.isNotEmpty()) formatViewCount(vc) else "")
+            seenIds.add(videoId)
+            items.add(item)
+        }
+        if (items.isEmpty()) return null
+        val group = YouTubeMediaGroup(groupType)
+        group.title = title
+        group.mediaItems = java.util.ArrayList(items)
         return group
     }
 
@@ -670,9 +731,12 @@ internal open class BrowseService2 {
         @JvmStatic @Volatile
         var excludedVideoIds: Set<String> = emptySet()
 
-        /** Kworb trending section title, set from string resources by app layer */
+        /** Section titles, set from string resources by app layer */
         @JvmStatic @Volatile
         var kworbTitle: String = "Trending Now"
+
+        @JvmStatic @Volatile
+        var chartsTopTitle: String = "Top Charts"
 
         /** Increments on each home refresh to rotate query pools */
         @JvmStatic
