@@ -179,15 +179,17 @@ internal open class BrowseService2 {
 
         // Helper: add items to unified pool, dedup, emit shuffled snapshot
         val addAndEmit = { items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
-            System.err.println("[PERF] addAndEmit called: ${items?.size ?: 0} items, pool=${pool.size}")
+            var added = 0; var skippedSeen = 0; var skippedExcluded = 0; var skippedNull = 0
             items?.forEach { item ->
-                val id = item.videoId ?: return@forEach
-                if (seenIds.add(id) && !excluded.contains(id)) {
-                    pool.add(item)
-                    shownVideoIds.add(id)
-                }
+                val id = item.videoId
+                if (id == null) { skippedNull++; return@forEach }
+                if (!seenIds.add(id)) { skippedSeen++; return@forEach }
+                if (excluded.contains(id)) { skippedExcluded++; return@forEach }
+                pool.add(item)
+                shownVideoIds.add(id)
+                added++
             }
-            System.err.println("[PERF] pool now: ${pool.size} items")
+            System.err.println("[PERF] pool: +$added (seen=$skippedSeen excl=$skippedExcluded null=$skippedNull) total=${pool.size}")
             if (pool.size >= 3) {
                 val shuffled = pool.toMutableList().apply { shuffle(random) }
                 val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
@@ -206,14 +208,16 @@ internal open class BrowseService2 {
         futures.add(executor.submit {
             try {
                 System.err.println("[PERF] Charts: starting...")
-                fetchYouTubeCharts(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded) { group ->
+                // Use separate seenIds for Charts internal dedup (don't pollute our pool's seenIds)
+                val chartSeenIds = mutableSetOf<String>()
+                fetchYouTubeCharts(MediaGroup.TYPE_HOME, chartSeenIds, excluded) { group ->
                     System.err.println("[PERF] Charts group: ${group?.title} items=${group?.mediaItems?.size}")
                     addAndEmit(group?.mediaItems)
                 }
             } catch (e: Exception) {
                 System.err.println("[PERF] Charts failed: ${e.message}")
                 try {
-                    val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
+                    val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)
                     addAndEmit(kworb?.mediaItems)
                 } catch (_: Exception) {}
             }
