@@ -540,11 +540,18 @@ internal open class BrowseService2 {
         return group
     }
 
-    /** Parse video chart entries into a MediaGroup with full metadata */
+    /** Parse video chart entries into a MediaGroup with full metadata.
+     *  For TRENDING (no viewCount), uses /player to fetch view counts in parallel. */
     private fun parseChartVideoViews(videoViews: org.json.JSONArray, title: String, groupType: Int,
                                      seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
-        val items = mutableListOf<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
+        data class ChartEntry(val item: com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem,
+                              val artistName: String, val channelName: String,
+                              val timeAgo: String, val viewCount: String)
+
+        val entries = mutableListOf<ChartEntry>()
         val count = videoViews.length().coerceAtMost(20)
+        val needViewCount = mutableListOf<ChartEntry>()
+
         for (j in 0 until count) {
             val v = videoViews.getJSONObject(j)
             val videoId = v.optString("id", "")
@@ -554,24 +561,17 @@ internal open class BrowseService2 {
             item.videoId = videoId
             item.title = v.optString("title", "")
 
-            // Artist/channel name (TRENDING has channelName, TOP_VIEWS has artists array)
-            val channelName = v.optString("channelName", "")
+            // Use artist name (not channel name which may have "- Topic" suffix)
             val artists = v.optJSONArray("artists")
-            val artistName = when {
-                channelName.isNotEmpty() -> channelName
-                artists != null && artists.length() > 0 -> artists.getJSONObject(0).optString("name", "")
-                else -> ""
-            }
-            item.author = artistName
+            val artistName = if (artists != null && artists.length() > 0) artists.getJSONObject(0).optString("name", "") else ""
+            val channelName = v.optString("channelName", "")
+            item.author = if (artistName.isNotEmpty()) artistName else channelName
 
-            // Thumbnail
             val thumbs = v.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
             if (thumbs != null && thumbs.length() > 0) {
                 item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
             }
 
-            // Build subtitle: channel · viewCount · upload time
-            val viewCount = v.optString("viewCount", "")
             val releaseDate = v.optJSONObject("releaseDate")
             val timeAgo = if (releaseDate != null) {
                 val y = releaseDate.optInt("year", 0)
@@ -580,19 +580,76 @@ internal open class BrowseService2 {
                 if (y > 0) formatTimeAgo("$y-${"%02d".format(m)}-${"%02d".format(d)}") else ""
             } else ""
 
-            item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(
-                artistName,
-                if (viewCount.isNotEmpty()) formatViewCount(viewCount) else null,
-                if (timeAgo.isNotEmpty()) timeAgo else null
-            )
-
+            val vc = v.optString("viewCount", "")
+            val entry = ChartEntry(item, artistName, channelName, timeAgo, vc)
+            entries.add(entry)
             seenIds.add(videoId)
-            items.add(item)
+
+            if (vc.isEmpty()) needViewCount.add(entry)
         }
+
+        // Fetch missing viewCounts via /player in parallel (for TRENDING_CHART)
+        if (needViewCount.isNotEmpty()) {
+            val httpClient = RetrofitOkHttpHelper.client
+            val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
+            val country = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().country ?: "US"
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(4)
+            val viewCounts = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+            val futures = needViewCount.map { entry ->
+                executor.submit {
+                    try {
+                        val body = """{"context":{"client":{"clientName":"WEB","clientVersion":"2.20260401.08.00","hl":"$lang","gl":"$country"}},"videoId":"${entry.item.videoId}"}"""
+                        val req = okhttp3.Request.Builder()
+                            .url("https://www.youtube.com/youtubei/v1/player?key=${com.liskovsoft.youtubeapi.common.helpers.AppConstants.API_KEY}&prettyPrint=false")
+                            .post(okhttp3.RequestBody.create(okhttp3.MediaType.parse("application/json"), body))
+                            .build()
+                        val resp = httpClient.newCall(req).execute()
+                        if (resp.isSuccessful) {
+                            val json = resp.body()?.string() ?: ""
+                            resp.close()
+                            val vc = org.json.JSONObject(json).optJSONObject("videoDetails")?.optString("viewCount", "") ?: ""
+                            if (vc.isNotEmpty()) viewCounts[entry.item.videoId] = vc
+                        } else resp.close()
+                    } catch (_: Exception) {}
+                }
+            }
+            for (f in futures) { try { f.get(5, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
+            executor.shutdown()
+
+            // Apply fetched viewCounts
+            for (entry in needViewCount) {
+                viewCounts[entry.item.videoId]?.let { vc ->
+                    (entries.find { it.item.videoId == entry.item.videoId } as? ChartEntry)
+                }
+            }
+            // Update entries with fetched viewCounts
+            for (i in entries.indices) {
+                val e = entries[i]
+                if (e.viewCount.isEmpty()) {
+                    val fetched = viewCounts[e.item.videoId] ?: ""
+                    if (fetched.isNotEmpty()) {
+                        entries[i] = e.copy(viewCount = fetched)
+                    }
+                }
+            }
+        }
+
+        // Build secondTitle with all available info
+        for (entry in entries) {
+            val displayName = if (entry.artistName.isNotEmpty()) entry.artistName else entry.channelName
+            entry.item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(
+                if (displayName.isNotEmpty()) displayName else null,
+                if (entry.viewCount.isNotEmpty()) formatViewCount(entry.viewCount) else null,
+                if (entry.timeAgo.isNotEmpty()) entry.timeAgo else null
+            )
+        }
+
+        val items = entries.map { it.item }
         if (items.isEmpty()) return null
         val group = YouTubeMediaGroup(groupType)
         group.title = title
-        group.mediaItems = java.util.ArrayList(items)
+        group.mediaItems = java.util.ArrayList<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>(items)
         return group
     }
 
