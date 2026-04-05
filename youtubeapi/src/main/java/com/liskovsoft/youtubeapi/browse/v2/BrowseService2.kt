@@ -37,10 +37,28 @@ internal open class BrowseService2 {
     //}
 
     /**
+     * Limit shownVideoIds to prevent infinite growth which causes all videos to be filtered.
+     * Keep only the most recent 200 IDs.
+     */
+    private fun trimShownVideoIds() {
+        if (shownVideoIds.size > 200) {
+            val toRemove = shownVideoIds.size - 100
+            val iter = shownVideoIds.iterator()
+            var removed = 0
+            while (iter.hasNext() && removed < toRemove) {
+                iter.next()
+                iter.remove()
+                removed++
+            }
+        }
+    }
+
+    /**
      * Phase 1: Fast results (~1-3s). Prefetch cache + TV client recommendations.
      * Displayed immediately while Phase 2 loads in background.
      */
     fun getHomeFast(): Pair<List<MediaGroup?>?, String?>? {
+        trimShownVideoIds()
         val t0 = System.currentTimeMillis()
         val result = mutableListOf<MediaGroup?>()
 
