@@ -269,12 +269,25 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
+            // Phase 1: Fast — TV client + prefetch cache (~1-3s)
             long t0 = System.currentTimeMillis();
-            kotlin.Pair<List<MediaGroup>, String> home = getBrowseService2().getHome();
-            long t1 = System.currentTimeMillis();
-            System.err.println("[PERF] getHome total: " + (t1 - t0) + "ms");
-            emitGroups(emitter, home);
-            System.err.println("[PERF] getHome + emit: " + (System.currentTimeMillis() - t0) + "ms");
+            kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
+            System.err.println("[PERF] Phase1: " + (System.currentTimeMillis() - t0) + "ms");
+
+            if (fast != null && fast.getFirst() != null && !fast.getFirst().isEmpty()) {
+                emitter.onNext(fast.getFirst());
+            }
+
+            // Phase 2: Stream — each search result emitted as soon as it arrives.
+            // No waiting for all to finish. User sees content progressively.
+            getBrowseService2().streamHomeExtra(group -> {
+                if (group != null && !group.isEmpty()) {
+                    System.err.println("[PERF] streaming group: " + group.getTitle());
+                    emitter.onNext(java.util.Collections.singletonList(group));
+                }
+            });
+
+            emitter.onComplete();
         });
     }
 

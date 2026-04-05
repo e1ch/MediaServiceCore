@@ -28,35 +28,28 @@ internal open class BrowseService2 {
     //    return if (home?.size ?: 0 < 5) listOfNotNull(home, getRecommended()).flatten() else home
     //}
 
-    fun getHome(): Pair<List<MediaGroup?>?, String?>? {
+    /**
+     * Phase 1: Fast results (~1-3s). Prefetch cache + TV client recommendations.
+     * Displayed immediately while Phase 2 loads in background.
+     */
+    fun getHomeFast(): Pair<List<MediaGroup?>?, String?>? {
         val t0 = System.currentTimeMillis()
         val result = mutableListOf<MediaGroup?>()
 
-        // 1. Prefetched content first (instant)
+        // 1. Prefetched content (instant)
         if (prefetchedGroups.isNotEmpty()) {
             result.addAll(prefetchedGroups)
             prefetchedGroups.clear()
         }
 
-        // 2. TV client (personalized recommendations for signed-in users)
-        val t1 = System.currentTimeMillis()
+        // 2. TV client browse
         val tvResult = getBrowseRowsTV(BrowseApiHelper::getHomeQuery, MediaGroup.TYPE_HOME)
-        System.err.println("[PERF] getHome: TV client took ${System.currentTimeMillis() - t1}ms")
-
         val tvGroups = tvResult?.first?.filter { group ->
             group?.mediaItems?.any { it?.videoId != null } == true
         }
-
         if (!tvGroups.isNullOrEmpty()) {
             result.addAll(tvGroups)
         }
-
-        // 3. ALWAYS add search-based results for variety (rotated queries each refresh)
-        val t2 = System.currentTimeMillis()
-        val queries = getRotatedHomeQueries()
-        val searchResults = getSearchFallbackParallel(queries, MediaGroup.TYPE_HOME)
-        System.err.println("[PERF] getHome: search took ${System.currentTimeMillis() - t2}ms, got ${searchResults.size} groups")
-        result.addAll(searchResults)
 
         // Track shown videoIds
         result.forEach { group ->
@@ -65,8 +58,101 @@ internal open class BrowseService2 {
             }
         }
 
-        System.err.println("[PERF] getHome: TOTAL ${System.currentTimeMillis() - t0}ms, ${result.size} groups")
+        System.err.println("[PERF] getHomeFast: ${System.currentTimeMillis() - t0}ms, ${result.size} groups")
         return if (result.isNotEmpty()) Pair(result, null) else tvResult
+    }
+
+    /**
+     * Phase 2: Rich results (~5-15s). Search + kworb trending.
+     * Added to the UI after Phase 1 is already visible.
+     */
+    fun getHomeExtra(): List<MediaGroup?> {
+        val t0 = System.currentTimeMillis()
+        val queries = getRotatedHomeQueries()
+        val searchResults = getSearchFallbackParallel(queries, MediaGroup.TYPE_HOME)
+        searchResults.forEach { group ->
+            group?.mediaItems?.forEach { item ->
+                item?.videoId?.let { shownVideoIds.add(it) }
+            }
+        }
+        System.err.println("[PERF] getHomeExtra: ${System.currentTimeMillis() - t0}ms, ${searchResults.size} groups")
+        return searchResults
+    }
+
+    /**
+     * Streaming version: fires callback for each search result as it arrives.
+     * All queries run in parallel; whoever finishes first emits first.
+     * kworb also runs in parallel alongside search queries.
+     */
+    fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
+        val queries = getRotatedHomeQueries()
+        if (queries.isEmpty()) return
+
+        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_YEAR
+        val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val excluded = excludedVideoIds
+
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(queries.size.coerceAtMost(4) + 1)
+
+        // Submit ALL searches + kworb concurrently
+        val futures = mutableListOf<java.util.concurrent.Future<*>>()
+
+        for ((title, query) in queries) {
+            futures.add(executor.submit {
+                try {
+                    val tq = System.currentTimeMillis()
+                    val sr = RetrofitHelper.get(
+                        mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query, dateFilter))
+                    )
+                    System.err.println("[PERF] stream search '$query' took ${System.currentTimeMillis() - tq}ms")
+                    sr?.let {
+                        val groups = YouTubeMediaGroup.from(it, MediaGroup.TYPE_HOME)
+                        groups?.firstOrNull()?.let { group ->
+                            (group as? YouTubeMediaGroup)?.title = title
+                            group.mediaItems?.removeAll { item ->
+                                val id = item?.videoId ?: return@removeAll false
+                                !seenIds.add(id) || excluded.contains(id)
+                            }
+                            if (group.isEmpty != true) {
+                                group.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
+                                onGroupReady.accept(group)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    System.err.println("[PERF] stream search failed: ${e.message}")
+                }
+            })
+        }
+
+        // kworb in parallel
+        futures.add(executor.submit {
+            try {
+                val trendingGroup = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
+                if (trendingGroup != null) {
+                    trendingGroup.mediaItems?.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
+                    onGroupReady.accept(trendingGroup)
+                }
+            } catch (e: Exception) {
+                System.err.println("[PERF] kworb stream failed: ${e.message}")
+            }
+        })
+
+        // Wait for all to complete
+        for (f in futures) {
+            try { f.get(20, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
+        }
+        executor.shutdown()
+    }
+
+    /** Legacy single-call (used by non-Observable getHome in YouTubeContentService) */
+    fun getHome(): Pair<List<MediaGroup?>?, String?>? {
+        val fast = getHomeFast()
+        val extra = getHomeExtra()
+        val combined = mutableListOf<MediaGroup?>()
+        fast?.first?.let { combined.addAll(it) }
+        combined.addAll(extra)
+        return if (combined.isNotEmpty()) Pair(combined, null) else fast
     }
 
     /**
