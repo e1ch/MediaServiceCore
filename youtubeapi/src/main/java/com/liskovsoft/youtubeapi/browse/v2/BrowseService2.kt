@@ -179,6 +179,7 @@ internal open class BrowseService2 {
 
         // Helper: add items to unified pool, dedup, emit shuffled snapshot
         val addAndEmit = { items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
+            System.err.println("[PERF] addAndEmit called: ${items?.size ?: 0} items, pool=${pool.size}")
             items?.forEach { item ->
                 val id = item.videoId ?: return@forEach
                 if (seenIds.add(id) && !excluded.contains(id)) {
@@ -186,6 +187,7 @@ internal open class BrowseService2 {
                     shownVideoIds.add(id)
                 }
             }
+            System.err.println("[PERF] pool now: ${pool.size} items")
             if (pool.size >= 3) {
                 val shuffled = pool.toMutableList().apply { shuffle(random) }
                 val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
@@ -203,10 +205,13 @@ internal open class BrowseService2 {
         // 1. YouTube Charts (fast)
         futures.add(executor.submit {
             try {
+                System.err.println("[PERF] Charts: starting...")
                 fetchYouTubeCharts(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded) { group ->
+                    System.err.println("[PERF] Charts group: ${group?.title} items=${group?.mediaItems?.size}")
                     addAndEmit(group?.mediaItems)
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                System.err.println("[PERF] Charts failed: ${e.message}")
                 try {
                     val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, seenIds as MutableSet<String>, excluded)
                     addAndEmit(kworb?.mediaItems)
