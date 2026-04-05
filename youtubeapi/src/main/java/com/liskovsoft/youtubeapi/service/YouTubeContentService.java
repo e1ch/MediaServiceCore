@@ -311,18 +311,8 @@ class YouTubeContentService implements ContentService {
                 // kworb failed, continue
             }
 
-            // 2. Search-based results for variety (non-music focused queries)
-            long t0 = System.currentTimeMillis();
-            List<MediaGroup> search = getBrowseService2().getSearchFallbackParallel(
-                com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getTrendingQueries(),
-                MediaGroup.TYPE_TRENDING);
-            System.err.println("[PERF] getTrending search: " + (System.currentTimeMillis() - t0) + "ms");
-            if (search != null && !search.isEmpty()) {
-                emitter.onNext(search);
-            }
-
-            // NOTE: YouTube Charts (music-only) deliberately NOT included here.
-            // Charts data goes to Music tab instead to avoid duplicate music content.
+            // No search-based "trending" queries — they return clickbait/SEO garbage.
+            // Trending tab relies on kworb (real trending data) only.
 
             emitter.onComplete();
         });
