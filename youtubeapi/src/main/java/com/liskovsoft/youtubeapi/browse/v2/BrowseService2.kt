@@ -183,9 +183,12 @@ internal open class BrowseService2 {
                     // Jitter: 200-400ms random delay to spread requests
                     Thread.sleep(200L + random.nextInt(200))
                     val tq = System.currentTimeMillis()
-                    // Filter: THIS_MONTH — only show videos uploaded in the last 30 days
-                    val monthFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH
-                    val sr = searchWithVisitorData(query, monthFilter)
+                    // Filter: THIS_WEEK first (triggers "新影片" badge), fallback THIS_MONTH
+                    var sr = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK)
+                    // If too few results this week, try this month
+                    if (sr == null || (sr.sections?.firstOrNull()?.itemWrappers?.size ?: 0) < 3) {
+                        sr = searchWithVisitorData(query, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH)
+                    }
                     System.err.println("[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
                     searchSemaphore.release()
 
@@ -288,8 +291,8 @@ internal open class BrowseService2 {
     fun getSearchFallbackParallel(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
         if (queries.isEmpty()) return emptyList()
 
-        // Use "This Month" upload date filter — only fresh content (last 30 days)
-        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH
+        // Use "This Week" filter — triggers "新影片" badge on results
+        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK
 
         val result = mutableListOf<MediaGroup?>()
         val seenIds = mutableSetOf<String>()
