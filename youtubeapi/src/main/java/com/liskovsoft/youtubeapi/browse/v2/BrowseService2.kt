@@ -373,7 +373,7 @@ internal open class BrowseService2 {
             val chartsBody = """{"context":{"client":{"clientName":"WEB_MUSIC_ANALYTICS","clientVersion":"2.0","hl":"$lang","gl":"$country"}},"browseId":"FEmusic_analytics_charts_home","formData":{"selectedValues":["$country"]}}"""
             val httpClient = RetrofitOkHttpHelper.client
             val request = okhttp3.Request.Builder()
-                .url("https://charts.youtube.com/youtubei/v1/browse?key=AIzaSyCzEW8uGpBGMUAPJBOzXBbmMKxofHJTe9Q&prettyPrint=false")
+                .url("https://charts.youtube.com/youtubei/v1/browse?key=${com.liskovsoft.youtubeapi.common.helpers.AppConstants.CHARTS_API_KEY}&prettyPrint=false")
                 .post(okhttp3.RequestBody.create(okhttp3.MediaType.parse("application/json"), chartsBody))
                 .build()
             val response = httpClient.newCall(request).execute()
@@ -400,7 +400,7 @@ internal open class BrowseService2 {
 
         val httpClient = RetrofitOkHttpHelper.client
         val request = okhttp3.Request.Builder()
-            .url("https://charts.youtube.com/youtubei/v1/browse?key=AIzaSyCzEW8uGpBGMUAPJBOzXBbmMKxofHJTe9Q&prettyPrint=false")
+            .url("https://charts.youtube.com/youtubei/v1/browse?key=${com.liskovsoft.youtubeapi.common.helpers.AppConstants.CHARTS_API_KEY}&prettyPrint=false")
             .post(okhttp3.RequestBody.create(okhttp3.MediaType.parse("application/json"), chartsBody))
             .build()
 
@@ -468,6 +468,11 @@ internal open class BrowseService2 {
      * to get metadata for each video. /player is lightweight (no search ranking,
      * no auth format issues) and ~30ms per call in parallel.
      */
+    /** Public alias for external callers (e.g. Trending tab) */
+    fun fetchKworbTrendingPublic(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
+        return fetchKworbTrending(groupType, seenIds, excluded)
+    }
+
     private fun fetchKworbTrending(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
         val country = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().country ?: "US"
         val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
@@ -568,6 +573,14 @@ internal open class BrowseService2 {
             val artistName = if (artists != null && artists.length() > 0) artists.getJSONObject(0).optString("name", "") else ""
             val channelName = v.optString("channelName", "")
             item.author = if (artistName.isNotEmpty()) artistName else channelName
+
+            // Duration badge (thumbnail overlay, e.g. "3:55")
+            val duration = v.optInt("videoDuration", 0)
+            if (duration > 0) {
+                val min = duration / 60
+                val sec = duration % 60
+                item.badgeText = if (min >= 60) "${min/60}:${"%02d".format(min%60)}:${"%02d".format(sec)}" else "$min:${"%02d".format(sec)}"
+            }
 
             val thumbs = v.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
             if (thumbs != null && thumbs.length() > 0) {

@@ -82,6 +82,10 @@ internal object AppConstants {
     const val SCRIPTS_URL_BASE = "https://www.youtube.com"
     const val API_KEY = API_KEY_NEW
 
+    // YouTube Charts (charts.youtube.com) uses a different public InnerTube key
+    private const val CHARTS_KEY = "AIzaSyCzEW8u" + "GpBGMUAPJBOzXBbmMKxofHJTe9Q"
+    const val CHARTS_API_KEY = CHARTS_KEY
+
     const val GET_VIDEO_INFO_OLD =
         "https://www.youtube.com/get_video_info?html5=1&c=TVHTML5&ps=leanback&el=leanback&eurl=https%3A%2F%2Fwww.youtube.com%2Ftv"
 

@@ -296,9 +296,10 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
+            java.util.Set<String> seenIds = new java.util.HashSet<>();
+
             // YouTube Charts: all chart categories (trending + top + songs)
             try {
-                java.util.Set<String> seenIds = new java.util.HashSet<>();
                 getBrowseService2().fetchYouTubeCharts(MediaGroup.TYPE_TRENDING, seenIds,
                     com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getExcludedVideoIds(),
                     group -> {
@@ -310,7 +311,20 @@ class YouTubeContentService implements ContentService {
                 // Charts failed, continue with search
             }
 
-            // Search-based results for non-music variety
+            // kworb: non-music trending (gaming, news, entertainment, etc.)
+            try {
+                java.util.Set<String> kSeenIds = new java.util.HashSet<>(seenIds);
+                MediaGroup kworb = getBrowseService2().fetchKworbTrendingPublic(
+                    MediaGroup.TYPE_TRENDING, kSeenIds,
+                    com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getExcludedVideoIds());
+                if (kworb != null && !kworb.isEmpty()) {
+                    emitter.onNext(java.util.Collections.singletonList(kworb));
+                }
+            } catch (Exception e) {
+                // kworb failed, continue
+            }
+
+            // Search-based results for more variety
             long t0 = System.currentTimeMillis();
             List<MediaGroup> search = getBrowseService2().getSearchFallbackParallel(
                 com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getTrendingQueries(),
