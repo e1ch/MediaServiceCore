@@ -135,7 +135,6 @@ internal open class BrowseService2 {
         }
 
         val queries = getRotatedHomeQueries()
-        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_YEAR
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val excluded = excludedVideoIds
         val random = java.util.Random()
@@ -167,7 +166,9 @@ internal open class BrowseService2 {
             }
         })
 
-        // Search queries: only on HARD refresh, max 2 concurrent, 200-400ms jitter
+        // Search queries: only on HARD refresh
+        // No date filter — YouTube Charts already provides fresh content,
+        // search adds variety/depth. Date filter was causing too few results.
         if (level < REFRESH_HARD || queries.isEmpty()) {
             for (f in futures) { try { f.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
             executor.shutdown()
@@ -182,7 +183,7 @@ internal open class BrowseService2 {
                     // Jitter: 200-400ms random delay to spread requests
                     Thread.sleep(200L + random.nextInt(200))
                     val tq = System.currentTimeMillis()
-                    val sr = searchWithVisitorData(query, dateFilter)
+                    val sr = searchWithVisitorData(query)
                     System.err.println("[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
                     searchSemaphore.release()
 
@@ -240,20 +241,24 @@ internal open class BrowseService2 {
      * FEtrending endpoint is deprecated (returns 400 for all clients).
      * Uses search-based trending directly.
      */
+    /**
+     * Trending tab: full YouTube Charts (all categories, up to 50 per chart)
+     * + search-based results for non-music content variety.
+     */
     fun getTrending(): List<MediaGroup?>? {
-        // Try YouTube Charts first (official trending data)
         val result = mutableListOf<MediaGroup?>()
         val seenIds = mutableSetOf<String>()
+
+        // YouTube Charts: trending + top views + top songs
         try {
             fetchYouTubeCharts(MediaGroup.TYPE_TRENDING, seenIds, excludedVideoIds) { group ->
                 if (group != null) result.add(group)
             }
         } catch (_: Exception) {}
 
-        // Add search-based results for more variety
-        if (result.size < 3) {
-            result.addAll(getSearchFallbackParallel(trendingQueries, MediaGroup.TYPE_TRENDING))
-        }
+        // Search-based results for non-music content (gaming, news, etc.)
+        val searchResults = getSearchFallbackParallel(trendingQueries, MediaGroup.TYPE_TRENDING)
+        result.addAll(searchResults)
 
         return result.ifEmpty { null }
     }
@@ -300,7 +305,7 @@ internal open class BrowseService2 {
             val futures = remaining.map { (title, query) ->
                 executor.submit(java.util.concurrent.Callable {
                     val tq = System.currentTimeMillis()
-                    val sr = searchWithVisitorData(query, dateFilter)
+                    val sr = searchWithVisitorData(query)
                     System.err.println("[PERF] parallel search '$query' took ${System.currentTimeMillis() - tq}ms")
                     Pair(title, sr)
                 })
@@ -334,13 +339,62 @@ internal open class BrowseService2 {
      * Returns two groups: TOP_VIEWS (most viewed) and TRENDING (rising).
      * Single API call, full metadata included — no extra /player lookups needed.
      */
-    private fun fetchYouTubeCharts(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>,
-                                   onGroupReady: java.util.function.Consumer<MediaGroup?>? = null): MediaGroup? {
+    /**
+     * Fetches trending from YouTube Charts API.
+     * If all videos in current week are watched, auto-falls back to previous weeks.
+     */
+    fun fetchYouTubeCharts(groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>,
+                           onGroupReady: java.util.function.Consumer<MediaGroup?>? = null): MediaGroup? {
         val country = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().country ?: "US"
         val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
 
         val t0 = System.currentTimeMillis()
-        val chartsBody = """{"context":{"client":{"clientName":"WEB_MUSIC_ANALYTICS","clientVersion":"2.0","hl":"$lang","gl":"$country"}},"browseId":"FEmusic_analytics_charts_home","formData":{"selectedValues":["$country"]}}"""
+        // First try current week, if too few results auto-extend to previous weeks
+        val result = fetchChartsForPeriod(country, lang, null, groupType, seenIds, excluded, onGroupReady)
+
+        // If we got very few items (most were watched), try previous week too
+        val totalItems = result?.mediaItems?.size ?: 0
+        if (totalItems < 5) {
+            val periods = getChartPeriods(country, lang)
+            for (period in periods.drop(1).take(2)) { // try 2 previous weeks
+                fetchChartsForPeriod(country, lang, period, groupType, seenIds, excluded, onGroupReady)
+            }
+        }
+
+        System.err.println("[PERF] YouTube Charts total: ${System.currentTimeMillis() - t0}ms")
+        return result
+    }
+
+    /** Get available chart periods from Charts API */
+    private fun getChartPeriods(country: String, lang: String): List<String> {
+        try {
+            val chartsBody = """{"context":{"client":{"clientName":"WEB_MUSIC_ANALYTICS","clientVersion":"2.0","hl":"$lang","gl":"$country"}},"browseId":"FEmusic_analytics_charts_home","formData":{"selectedValues":["$country"]}}"""
+            val httpClient = RetrofitOkHttpHelper.client
+            val request = okhttp3.Request.Builder()
+                .url("https://charts.youtube.com/youtubei/v1/browse?key=AIzaSyCzEW8uGpBGMUAPJBOzXBbmMKxofHJTe9Q&prettyPrint=false")
+                .post(okhttp3.RequestBody.create(okhttp3.MediaType.parse("application/json"), chartsBody))
+                .build()
+            val response = httpClient.newCall(request).execute()
+            if (!response.isSuccessful) { response.close(); return emptyList() }
+            val body = response.body()?.string() ?: return emptyList()
+            response.close()
+
+            val json = org.json.JSONObject(body)
+            val pm = json.getJSONObject("contents").getJSONObject("sectionListRenderer")
+                .getJSONArray("contents").getJSONObject(0)
+                .getJSONObject("musicAnalyticsSectionRenderer").getJSONObject("content")
+                .getJSONObject("perspectiveMetadata")
+            val periods = pm.getJSONObject("chartRestrictions").getJSONArray("chartPeriods")
+            return (0 until periods.length()).map { periods.getJSONObject(it).getString("id") }
+        } catch (_: Exception) { return emptyList() }
+    }
+
+    /** Fetch charts for a specific period (null = current) */
+    private fun fetchChartsForPeriod(country: String, lang: String, period: String?,
+                                     groupType: Int, seenIds: MutableSet<String>, excluded: Set<String>,
+                                     onGroupReady: java.util.function.Consumer<MediaGroup?>?): MediaGroup? {
+        val selectedValues = if (period != null) """["$country","$period"]""" else """["$country"]"""
+        val chartsBody = """{"context":{"client":{"clientName":"WEB_MUSIC_ANALYTICS","clientVersion":"2.0","hl":"$lang","gl":"$country"}},"browseId":"FEmusic_analytics_charts_home","formData":{"selectedValues":$selectedValues}}"""
 
         val httpClient = RetrofitOkHttpHelper.client
         val request = okhttp3.Request.Builder()
@@ -404,7 +458,6 @@ internal open class BrowseService2 {
             System.err.println("[PERF] YouTube Charts parse error: ${e.message}")
         }
 
-        System.err.println("[PERF] YouTube Charts: ${System.currentTimeMillis() - t0}ms")
         return null
     }
 
@@ -487,7 +540,7 @@ internal open class BrowseService2 {
         return group
     }
 
-    /** Parse video chart entries into a MediaGroup */
+    /** Parse video chart entries into a MediaGroup with full metadata */
     private fun parseChartVideoViews(videoViews: org.json.JSONArray, title: String, groupType: Int,
                                      seenIds: MutableSet<String>, excluded: Set<String>): MediaGroup? {
         val items = mutableListOf<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
@@ -500,13 +553,39 @@ internal open class BrowseService2 {
             val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
             item.videoId = videoId
             item.title = v.optString("title", "")
+
+            // Artist/channel name (TRENDING has channelName, TOP_VIEWS has artists array)
+            val channelName = v.optString("channelName", "")
             val artists = v.optJSONArray("artists")
-            val artistName = if (artists != null && artists.length() > 0) artists.getJSONObject(0).optString("name", "") else ""
+            val artistName = when {
+                channelName.isNotEmpty() -> channelName
+                artists != null && artists.length() > 0 -> artists.getJSONObject(0).optString("name", "")
+                else -> ""
+            }
             item.author = artistName
+
+            // Thumbnail
             val thumbs = v.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
-            if (thumbs != null && thumbs.length() > 0) item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
-            val vc = v.optString("viewCount", "")
-            item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(artistName, if (vc.isNotEmpty()) formatViewCount(vc) else "")
+            if (thumbs != null && thumbs.length() > 0) {
+                item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
+            }
+
+            // Build subtitle: channel · viewCount · upload time
+            val viewCount = v.optString("viewCount", "")
+            val releaseDate = v.optJSONObject("releaseDate")
+            val timeAgo = if (releaseDate != null) {
+                val y = releaseDate.optInt("year", 0)
+                val m = releaseDate.optInt("month", 1)
+                val d = releaseDate.optInt("day", 1)
+                if (y > 0) formatTimeAgo("$y-${"%02d".format(m)}-${"%02d".format(d)}") else ""
+            } else ""
+
+            item.secondTitle = com.liskovsoft.googlecommon.common.helpers.YouTubeHelper.createInfo(
+                artistName,
+                if (viewCount.isNotEmpty()) formatViewCount(viewCount) else null,
+                if (timeAgo.isNotEmpty()) timeAgo else null
+            )
+
             seenIds.add(videoId)
             items.add(item)
         }

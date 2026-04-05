@@ -358,6 +358,20 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
+            // YouTube Charts: music-specific charts (Top Songs + Top Views)
+            try {
+                java.util.Set<String> seenIds = new java.util.HashSet<>();
+                getBrowseService2().fetchYouTubeCharts(MediaGroup.TYPE_MUSIC, seenIds,
+                    com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getExcludedVideoIds(),
+                    group -> {
+                        if (group != null && !group.isEmpty()) {
+                            emitter.onNext(java.util.Collections.singletonList(group));
+                        }
+                    });
+            } catch (Exception e) {
+                // Charts failed, continue with regular music
+            }
+
             MediaGroup firstRow = getBrowseService2().getLikedMusic();
             emitGroupsPartial(emitter, Collections.singletonList(firstRow));
 
