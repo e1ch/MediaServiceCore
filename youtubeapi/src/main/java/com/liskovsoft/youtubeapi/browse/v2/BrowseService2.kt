@@ -434,11 +434,14 @@ internal open class BrowseService2 {
                 }
             }
 
-            // Parse songs chart (TOP_VIEWS — different from video chart, has encryptedVideoId)
-            val trackTypes = json.getJSONObject("contents").getJSONObject("sectionListRenderer")
-                .getJSONArray("contents").getJSONObject(0)
-                .getJSONObject("musicAnalyticsSectionRenderer").getJSONObject("content")
-                .optJSONArray("trackTypes")
+            // Parse songs chart — only for Music tab (TYPE_MUSIC), not Home/Trending
+            // Avoids duplicate music content across tabs
+            val trackTypes = if (groupType == MediaGroup.TYPE_MUSIC) {
+                json.getJSONObject("contents").getJSONObject("sectionListRenderer")
+                    .getJSONArray("contents").getJSONObject(0)
+                    .getJSONObject("musicAnalyticsSectionRenderer").getJSONObject("content")
+                    .optJSONArray("trackTypes")
+            } else null
 
             if (trackTypes != null && trackTypes.length() > 0) {
                 val songChart = trackTypes.getJSONObject(0)

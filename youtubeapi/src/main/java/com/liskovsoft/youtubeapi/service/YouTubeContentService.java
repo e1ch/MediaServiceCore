@@ -297,26 +297,13 @@ class YouTubeContentService implements ContentService {
             checkSigned();
 
             java.util.Set<String> seenIds = new java.util.HashSet<>();
+            java.util.Set<String> excluded = com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getExcludedVideoIds();
 
-            // YouTube Charts: all chart categories (trending + top + songs)
+            // 1. kworb FIRST — mixed content (gaming, news, entertainment, music, etc.)
+            // This is the primary source for Trending tab (not music-only Charts)
             try {
-                getBrowseService2().fetchYouTubeCharts(MediaGroup.TYPE_TRENDING, seenIds,
-                    com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getExcludedVideoIds(),
-                    group -> {
-                        if (group != null && !group.isEmpty()) {
-                            emitter.onNext(java.util.Collections.singletonList(group));
-                        }
-                    });
-            } catch (Exception e) {
-                // Charts failed, continue with search
-            }
-
-            // kworb: non-music trending (gaming, news, entertainment, etc.)
-            try {
-                java.util.Set<String> kSeenIds = new java.util.HashSet<>(seenIds);
                 MediaGroup kworb = getBrowseService2().fetchKworbTrendingPublic(
-                    MediaGroup.TYPE_TRENDING, kSeenIds,
-                    com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getExcludedVideoIds());
+                    MediaGroup.TYPE_TRENDING, seenIds, excluded);
                 if (kworb != null && !kworb.isEmpty()) {
                     emitter.onNext(java.util.Collections.singletonList(kworb));
                 }
@@ -324,7 +311,7 @@ class YouTubeContentService implements ContentService {
                 // kworb failed, continue
             }
 
-            // Search-based results for more variety
+            // 2. Search-based results for variety (non-music focused queries)
             long t0 = System.currentTimeMillis();
             List<MediaGroup> search = getBrowseService2().getSearchFallbackParallel(
                 com.liskovsoft.youtubeapi.browse.v2.BrowseService2.getTrendingQueries(),
@@ -333,6 +320,9 @@ class YouTubeContentService implements ContentService {
             if (search != null && !search.isEmpty()) {
                 emitter.onNext(search);
             }
+
+            // NOTE: YouTube Charts (music-only) deliberately NOT included here.
+            // Charts data goes to Music tab instead to avoid duplicate music content.
 
             emitter.onComplete();
         });
