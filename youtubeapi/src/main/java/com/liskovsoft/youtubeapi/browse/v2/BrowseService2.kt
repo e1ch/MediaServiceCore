@@ -14,21 +14,30 @@ import com.liskovsoft.youtubeapi.next.v2.gen.getItems
 import com.liskovsoft.youtubeapi.next.v2.gen.getContinuationToken
 import com.liskovsoft.youtubeapi.next.v2.gen.getShelves
 import com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup
+import com.liskovsoft.googlecommon.common.helpers.RetrofitOkHttpHelper
 import android.util.Log
 
 internal open class BrowseService2 {
     private val mBrowseApi = RetrofitHelper.create(BrowseApi::class.java)
     private val TAG = "BrowseService2"
     private val mSearchApi = RetrofitHelper.create(com.liskovsoft.youtubeapi.search.SearchApi::class.java)
+    /**
+     * Search using WEB client without auth (always anonymous).
+     * When signed in, auth headers cause TV-format responses that our SearchResult can't parse.
+     * Uses addAuthSkip to force API-key mode even when signed in.
+     */
     private fun searchWithVisitorData(query: String, options: Int = -1): com.liskovsoft.youtubeapi.search.models.SearchResult? {
-        val visitorData = com.liskovsoft.youtubeapi.app.AppService.instance().visitorData
         val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQuery(query, options)
-        return RetrofitHelper.get(mSearchApi.getSearchResult(searchQuery, visitorData))
+        val call = mSearchApi.getSearchResult(searchQuery)
+        // Tell OkHttp interceptor to skip auth for this request (use API key instead)
+        call.request()?.let { RetrofitOkHttpHelper.addAuthSkip(it) }
+        return RetrofitHelper.get(call)
     }
     private fun searchWithVisitorData(query: String): com.liskovsoft.youtubeapi.search.models.SearchResult? {
-        val visitorData = com.liskovsoft.youtubeapi.app.AppService.instance().visitorData
         val searchQuery = com.liskovsoft.youtubeapi.search.SearchApiHelper.getSearchQuery(query)
-        return RetrofitHelper.get(mSearchApi.getSearchResult(searchQuery, visitorData))
+        val call = mSearchApi.getSearchResult(searchQuery)
+        call.request()?.let { RetrofitOkHttpHelper.addAuthSkip(it) }
+        return RetrofitHelper.get(call)
     }
 
     //fun getHome(): List<MediaGroup?>? {
@@ -115,8 +124,10 @@ internal open class BrowseService2 {
         if (queries.isEmpty()) return
 
         val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_YEAR
+        // Only dedup across Phase 2 search results, NOT against Phase 1 TV results.
+        // This ensures trending/search content always appears even if TV already showed some.
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-        val excluded = excludedVideoIds
+        val excluded = excludedVideoIds // watched videos only
 
         val executor = java.util.concurrent.Executors.newFixedThreadPool(queries.size.coerceAtMost(4) + 1)
 
@@ -310,14 +321,29 @@ internal open class BrowseService2 {
             executor.submit {
                 try {
                     val sr = searchWithVisitorData(videoId)
+                    if (sr == null) {
+                        System.err.println("[PERF] kworb lookup $videoId: search returned null")
+                    }
                     sr?.let {
                         val groups = YouTubeMediaGroup.from(it, groupType)
+                        if (groups.isNullOrEmpty()) {
+                            System.err.println("[PERF] kworb lookup $videoId: groups null/empty (sections=${it.sections?.size})")
+                        }
                         // Take the first result that matches this exact videoId
-                        groups?.firstOrNull()?.mediaItems?.firstOrNull { item ->
+                        val matched = groups?.firstOrNull()?.mediaItems?.firstOrNull { item ->
                             item?.videoId == videoId
-                        }?.let { item ->
-                            allItems.add(item)
+                        }
+                        if (matched != null) {
+                            allItems.add(matched)
                             seenIds.add(videoId)
+                        } else {
+                            // Fallback: take first video result even if ID doesn't match exactly
+                            groups?.firstOrNull()?.mediaItems?.firstOrNull { item ->
+                                item?.videoId != null
+                            }?.let { item ->
+                                allItems.add(item)
+                                seenIds.add(item.videoId)
+                            }
                         }
                     }
                 } catch (_: Exception) {}
