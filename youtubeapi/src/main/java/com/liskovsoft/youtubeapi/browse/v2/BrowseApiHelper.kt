@@ -25,7 +25,7 @@ internal object BrowseApiHelper {
     private const val KIDS_HOME_PARAMS = "\"browseId\":\"FEkids_home\",\"params\":\"%s\""
     private const val WHAT_TO_WATCH = "\"browseId\":\"FEwhat_to_watch\""
     private const val HOME_TV = "\"browseId\":\"default\""
-    private const val TRENDING = "\"browseId\":\"FEtrending\""
+    // FEtrending is deprecated by YouTube (returns 400 for all clients since ~2025)
     private const val HYPE = "\"browseId\":\"FEhype_leaderboard\""
     private const val SUBSCRIPTIONS = "\"browseId\":\"FEsubscriptions\""
     private const val SPORTS = "\"browseId\":\"FEtopics_sports\""
@@ -57,9 +57,7 @@ internal object BrowseApiHelper {
         return PostDataHelper.createQuery(AppClient.WEB.browseTemplate, WHAT_TO_WATCH)
     }
 
-    fun getTrendingQuery(client: AppClient): String {
-        return PostDataHelper.createQuery(client.browseTemplate, TRENDING)
-    }
+    // getTrendingQuery removed — FEtrending deprecated, use BrowseService2.getSearchFallback() instead
 
     fun getHypeQuery(client: AppClient): String {
         return PostDataHelper.createQuery(client.browseTemplate, HYPE)

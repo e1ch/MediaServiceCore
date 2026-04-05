@@ -16,9 +16,11 @@ import com.liskovsoft.youtubeapi.next.v2.gen.getShelves
 import com.liskovsoft.youtubeapi.search.SearchApi
 import com.liskovsoft.youtubeapi.search.SearchApiHelper
 import com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup
+import android.util.Log
 
 internal open class BrowseService2 {
     private val mBrowseApi = RetrofitHelper.create(BrowseApi::class.java)
+    private val TAG = "BrowseService2"
     private val mSearchApi = RetrofitHelper.create(SearchApi::class.java)
 
     //fun getHome(): List<MediaGroup?>? {
@@ -27,53 +29,53 @@ internal open class BrowseService2 {
     //}
 
     fun getHome(): Pair<List<MediaGroup?>?, String?>? {
-        // Try TV client first (works for signed-in users)
-        val tvResult = getBrowseRowsTV(BrowseApiHelper::getHomeQuery, MediaGroup.TYPE_HOME)
+        val t0 = System.currentTimeMillis()
 
-        // Check if TV result has real video content (not just login prompts/feedNudge).
+        // 1. Check prefetch cache FIRST (instant, from background prefetch)
+        val result = mutableListOf<MediaGroup?>()
+        if (prefetchedGroups.isNotEmpty()) {
+            result.addAll(prefetchedGroups)
+            prefetchedGroups.clear()
+            System.err.println("[PERF] getHome: used ${result.size} prefetched groups (instant)")
+        }
+
+        // 2. Try TV client (works for signed-in users)
+        val t1 = System.currentTimeMillis()
+        val tvResult = getBrowseRowsTV(BrowseApiHelper::getHomeQuery, MediaGroup.TYPE_HOME)
+        System.err.println("[PERF] getHome: TV client took ${System.currentTimeMillis() - t1}ms")
+
         val hasRealVideos = tvResult?.first?.any { group ->
             group?.mediaItems?.any { it?.videoId != null } == true
         } == true
 
         if (hasRealVideos) {
+            System.err.println("[PERF] getHome: TV has content, total ${System.currentTimeMillis() - t0}ms")
             return tvResult
         }
 
-        // Anonymous mode: use prefetched cache first, then fresh search fallback.
-        val result = mutableListOf<MediaGroup?>()
-
-        // 1. Consume prefetched groups (collected in background during playback)
-        if (prefetchedGroups.isNotEmpty()) {
-            result.addAll(prefetchedGroups)
-            prefetchedGroups.clear()
-        }
-
-        // 2. Add fresh search results (excluding already-shown videos)
-        val searchFallback = getSearchFallback(SEARCH_QUERIES_HOME, MediaGroup.TYPE_HOME)
+        // 3. Anonymous mode: parallel search fallback
+        val t2 = System.currentTimeMillis()
+        val searchFallback = getSearchFallbackParallel(homeQueries, MediaGroup.TYPE_HOME)
+        System.err.println("[PERF] getHome: parallel search took ${System.currentTimeMillis() - t2}ms, got ${searchFallback.size} groups")
         result.addAll(searchFallback)
 
-        // Track shown videoIds for future dedup
+        // Track shown videoIds
         result.forEach { group ->
             group?.mediaItems?.forEach { item ->
                 item?.videoId?.let { shownVideoIds.add(it) }
             }
         }
 
+        System.err.println("[PERF] getHome: TOTAL ${System.currentTimeMillis() - t0}ms")
         return if (result.isNotEmpty()) Pair(result, null) else tvResult
     }
 
+    /**
+     * FEtrending endpoint is deprecated (returns 400 for all clients).
+     * Uses search-based trending directly.
+     */
     fun getTrending(): List<MediaGroup?>? {
-        // Try FEtrending first
-        val result = getBrowseRowsWeb(BrowseApiHelper.getTrendingQuery(AppClient.WEB), MediaGroup.TYPE_TRENDING)
-        val hasRealTrending = result?.any { group ->
-            group?.mediaItems?.any { it?.videoId != null } == true
-        } == true
-        if (hasRealTrending) {
-            return result
-        }
-
-        // FEtrending often returns 400. Fall back to search-based trending.
-        return getSearchFallback(SEARCH_QUERIES_TRENDING, MediaGroup.TYPE_TRENDING).ifEmpty { result }
+        return getSearchFallbackParallel(trendingQueries, MediaGroup.TYPE_TRENDING)
     }
 
     /**
@@ -81,19 +83,94 @@ internal open class BrowseService2 {
      * Each query produces a named MediaGroup (shelf), similar to PrismTube's approach.
      * Deduplicates videos by videoId across all query results.
      */
+    /**
+     * Parallel version of search fallback — all queries execute concurrently.
+     * Reduces total time from sum(query_times) to max(query_times).
+     */
+    /**
+     * Optimized search: first query runs sequentially (warms up TLS/connection pool),
+     * then remaining queries run in parallel. This avoids concurrent initialization
+     * conflicts that cause timeouts on cold start.
+     */
+    fun getSearchFallbackParallel(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
+        if (queries.isEmpty()) return emptyList()
+
+        val result = mutableListOf<MediaGroup?>()
+        val seenIds = mutableSetOf<String>()
+        val excluded = excludedVideoIds
+
+        // 1. First query: sequential (warms up TLS + connection pool)
+        val first = queries.first()
+        val t1 = System.currentTimeMillis()
+        val firstResult = RetrofitHelper.get(
+            mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(first.second))
+        )
+        System.err.println("[PERF] first search '${first.second}' took ${System.currentTimeMillis() - t1}ms (warmup)")
+        addSearchResult(firstResult, first.first, groupType, result, seenIds, excluded)
+
+        // 2. Remaining queries: parallel (connection already warm)
+        if (queries.size > 1) {
+            val remaining = queries.drop(1)
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(remaining.size.coerceAtMost(3))
+            val futures = remaining.map { (title, query) ->
+                executor.submit(java.util.concurrent.Callable {
+                    val tq = System.currentTimeMillis()
+                    val sr = RetrofitHelper.get(
+                        mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
+                    )
+                    System.err.println("[PERF] parallel search '$query' took ${System.currentTimeMillis() - tq}ms")
+                    Pair(title, sr)
+                })
+            }
+            for (future in futures) {
+                try {
+                    val (title, sr) = future.get(10, java.util.concurrent.TimeUnit.SECONDS)
+                    addSearchResult(sr, title, groupType, result, seenIds, excluded)
+                } catch (e: Exception) {
+                    System.err.println("[PERF] search failed: ${e.message}")
+                }
+            }
+            executor.shutdown()
+        }
+
+        return result
+    }
+
+    private fun addSearchResult(
+        searchResult: com.liskovsoft.youtubeapi.search.models.SearchResult?,
+        title: String, groupType: Int,
+        result: MutableList<MediaGroup?>, seenIds: MutableSet<String>, excluded: Set<String>
+    ) {
+        searchResult?.let {
+            val groups = YouTubeMediaGroup.from(it, groupType)
+            groups?.firstOrNull()?.let { group ->
+                (group as? YouTubeMediaGroup)?.title = title
+                group.mediaItems?.removeAll { item ->
+                    val id = item?.videoId ?: return@removeAll false
+                    !seenIds.add(id) || excluded.contains(id)
+                }
+                if (group.isEmpty != true) result.add(group)
+            }
+        }
+    }
+
+    /**
+     * Sequential search fallback (used by prefetch and trending where parallelism is unnecessary).
+     */
     fun getSearchFallback(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
         val result = mutableListOf<MediaGroup?>()
         val seenIds = mutableSetOf<String>()
-        val excluded = excludedVideoIds // snapshot for thread safety
+        val excluded = excludedVideoIds
         for ((title, query) in queries) {
+            val tq = System.currentTimeMillis()
             val searchResult = RetrofitHelper.get(
                 mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
             )
+            System.err.println("[PERF]search '$query' took ${System.currentTimeMillis() - tq}ms")
             searchResult?.let {
                 val groups = YouTubeMediaGroup.from(it, groupType)
                 groups?.firstOrNull()?.let { group ->
                     (group as? YouTubeMediaGroup)?.title = title
-                    // Remove: duplicates across queries + already watched videos
                     group.mediaItems?.removeAll { item ->
                         val id = item?.videoId ?: return@removeAll false
                         !seenIds.add(id) || excluded.contains(id)
@@ -106,16 +183,23 @@ internal open class BrowseService2 {
     }
 
     companion object {
-        // Default English fallback queries. Callers should pass localized queries when possible.
-        @JvmField val SEARCH_QUERIES_HOME = listOf(
-            "Trending" to "trending videos",
-            "Popular" to "most popular videos today",
-            "Recommended" to "recommended videos"
+        /**
+         * Localized search queries, set by the app layer (BrowsePresenter)
+         * from Android string resources. Each pair is (displayTitle, searchQuery).
+         * Populated before home/trending loads. Falls back to English if not set.
+         */
+        @JvmStatic @Volatile
+        var homeQueries: List<Pair<String, String>> = listOf(
+            "Trending" to "popular music video",
+            "Popular" to "most viewed video",
+            "For You" to "best videos this week"
         )
-        @JvmField val SEARCH_QUERIES_TRENDING = listOf(
-            "Trending Now" to "trending videos today",
-            "Viral" to "viral videos",
-            "Popular Creators" to "popular youtube creators"
+
+        @JvmStatic @Volatile
+        var trendingQueries: List<Pair<String, String>> = listOf(
+            "Trending Now" to "trending music video",
+            "Viral" to "viral video this week",
+            "Charts" to "music chart"
         )
 
         /**

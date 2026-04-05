@@ -269,7 +269,12 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
-            emitGroups(emitter, getBrowseService2().getHome());
+            long t0 = System.currentTimeMillis();
+            kotlin.Pair<List<MediaGroup>, String> home = getBrowseService2().getHome();
+            long t1 = System.currentTimeMillis();
+            System.err.println("[PERF] getHome total: " + (t1 - t0) + "ms");
+            emitGroups(emitter, home);
+            System.err.println("[PERF] getHome + emit: " + (System.currentTimeMillis() - t0) + "ms");
         });
     }
 
@@ -278,7 +283,10 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
-            emitGroups(emitter, getBrowseService2().getTrending());
+            long t0 = System.currentTimeMillis();
+            List<MediaGroup> trending = getBrowseService2().getTrending();
+            System.err.println("[PERF] getTrending total: " + (System.currentTimeMillis() - t0) + "ms");
+            emitGroups(emitter, trending);
         });
     }
 
