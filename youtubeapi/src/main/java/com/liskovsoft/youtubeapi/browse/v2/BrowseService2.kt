@@ -720,7 +720,15 @@ internal open class BrowseService2 {
                 item.cardImageUrl = thumbs.getJSONObject(thumbs.length() - 1).optString("url", "")
             }
 
-            // Second title: channel name · view count · upload time (displayed below title)
+            // Duration badge (thumbnail overlay, e.g. "3:55")
+            val lengthSec = vd.optString("lengthSeconds", "0").toLongOrNull() ?: 0
+            if (lengthSec > 0) {
+                val min = (lengthSec / 60).toInt()
+                val sec = (lengthSec % 60).toInt()
+                item.badgeText = if (min >= 60) "${min/60}:${"%02d".format(min%60)}:${"%02d".format(sec)}" else "$min:${"%02d".format(sec)}"
+            }
+
+            // Second title: channel name · view count · upload time
             val author = vd.optString("author", "")
             val viewCount = formatViewCount(vd.optString("viewCount", ""))
             val publishDate = mf?.optString("publishDate", "") ?: ""
