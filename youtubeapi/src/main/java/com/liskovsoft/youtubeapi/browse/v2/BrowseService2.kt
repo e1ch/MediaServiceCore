@@ -166,9 +166,39 @@ internal open class BrowseService2 {
             }
         })
 
+        // Language discovery: search with stop words + sort by upload date
+        // Returns diverse, fresh, language-specific content with "新影片" badge
+        futures.add(executor.submit {
+            try {
+                searchSemaphore.acquire()
+                val stopWord = getLanguageStopWord()
+                val tq = System.currentTimeMillis()
+                // CAI= = sort by upload date → triggers "新影片" badge
+                val sr = searchWithVisitorData(stopWord, com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_WEEK)
+                System.err.println("[PERF] language discovery '$stopWord' took ${System.currentTimeMillis() - tq}ms")
+                searchSemaphore.release()
+
+                sr?.let {
+                    val groups = YouTubeMediaGroup.from(it, MediaGroup.TYPE_HOME)
+                    groups?.firstOrNull()?.let { group ->
+                        (group as? YouTubeMediaGroup)?.title = discoveryTitle
+                        group.mediaItems?.removeAll { item ->
+                            val id = item?.videoId ?: return@removeAll false
+                            !seenIds.add(id) || excluded.contains(id)
+                        }
+                        val mediaItems = group.mediaItems
+                        if (mediaItems != null && mediaItems.size >= 3) {
+                            mediaItems.forEach { item -> item?.videoId?.let { shownVideoIds.add(it) } }
+                            onGroupReady.accept(group)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                searchSemaphore.release()
+            }
+        })
+
         // Search queries: only on HARD refresh
-        // No date filter — YouTube Charts already provides fresh content,
-        // search adds variety/depth. Date filter was causing too few results.
         if (level < REFRESH_HARD || queries.isEmpty()) {
             for (f in futures) { try { f.get(25, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
             executor.shutdown()
@@ -237,6 +267,35 @@ internal open class BrowseService2 {
      * Query pools are set by the app layer from string resources via setHomeQueryPools().
      * Falls back to homeQueries if no pools are configured.
      */
+    /**
+     * Returns a random high-frequency stop word for the user's language.
+     * Searching this with CAI= (sort by date) returns diverse, fresh,
+     * language-specific content — effectively a "browse all new videos" for that locale.
+     */
+    private fun getLanguageStopWord(): String {
+        val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language ?: "en"
+        val random = java.util.Random()
+        val words = when {
+            lang.startsWith("zh") -> arrayOf("的", "了", "是", "在", "我", "有", "這", "不", "會", "很")
+            lang.startsWith("ko") -> arrayOf("는", "은", "이", "가", "를", "에서", "하는", "있는", "없는", "되는")
+            lang.startsWith("ja") -> arrayOf("の", "は", "を", "が", "に", "で", "と", "です", "ます", "した")
+            lang.startsWith("es") -> arrayOf("de", "la", "el", "en", "que", "los", "con", "por", "una", "del")
+            lang.startsWith("fr") -> arrayOf("de", "le", "la", "les", "et", "en", "des", "une", "que", "pour")
+            lang.startsWith("de") -> arrayOf("die", "der", "und", "ist", "von", "den", "das", "mit", "ein", "auf")
+            lang.startsWith("pt") -> arrayOf("de", "que", "não", "para", "com", "uma", "como", "mais", "dos", "por")
+            lang.startsWith("ru") -> arrayOf("и", "в", "не", "на", "что", "это", "как", "так", "все", "для")
+            lang.startsWith("ar") -> arrayOf("في", "من", "على", "هل", "ما", "هذا", "كيف", "لا", "مع", "عن")
+            lang.startsWith("hi") -> arrayOf("का", "है", "में", "और", "की", "को", "से", "पर", "ने", "एक")
+            lang.startsWith("th") -> arrayOf("ที่", "ใน", "และ", "ของ", "จะ", "ได้", "มี", "ไม่", "คือ", "ให้")
+            lang.startsWith("vi") -> arrayOf("của", "và", "là", "trong", "cho", "với", "một", "có", "được", "này")
+            lang.startsWith("tr") -> arrayOf("bir", "bu", "ve", "için", "ile", "olan", "çok", "gibi", "daha", "nasıl")
+            lang.startsWith("it") -> arrayOf("di", "che", "la", "per", "non", "con", "una", "sono", "come", "più")
+            lang.startsWith("pl") -> arrayOf("nie", "się", "jak", "ale", "czy", "tak", "już", "dla", "jest", "ten")
+            else -> arrayOf("the", "how", "why", "best", "new", "top", "most", "first", "what", "this")
+        }
+        return words[random.nextInt(words.size)]
+    }
+
     private fun getRotatedHomeQueries(): List<Pair<String, String>> {
         val pools = homeQueryPools
         if (pools.isEmpty()) return homeQueries
@@ -907,6 +966,9 @@ internal open class BrowseService2 {
 
         @JvmStatic @Volatile
         var chartsTopTitle: String = "Top Charts"
+
+        @JvmStatic @Volatile
+        var discoveryTitle: String = "Just Uploaded"
 
         /** Increments on each home refresh to rotate query pools */
         @JvmStatic
