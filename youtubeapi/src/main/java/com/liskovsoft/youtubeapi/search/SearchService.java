@@ -6,6 +6,7 @@ import com.liskovsoft.sharedutils.mylogger.Log;
 import com.liskovsoft.youtubeapi.app.AppService;
 import com.liskovsoft.youtubeapi.browse.v1.BrowseService;
 import com.liskovsoft.googlecommon.common.helpers.RetrofitHelper;
+import com.liskovsoft.googlecommon.common.helpers.RetrofitOkHttpHelper;
 import com.liskovsoft.googlecommon.common.locale.LocaleManager;
 import com.liskovsoft.youtubeapi.search.models.SearchResult;
 import com.liskovsoft.youtubeapi.search.models.SearchResultContinuation;
@@ -31,6 +32,9 @@ public class SearchService {
 
     public SearchResult getSearch(String searchText, int options) {
         Call<SearchResult> wrapper = mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(searchText, options), getAppService().getVisitorData());
+        // Skip auth headers: WEB client search format must be used (not TV format)
+        // Without this, signed-in users get TV-format JSON that SearchResult can't parse
+        try { RetrofitOkHttpHelper.addAuthSkip(wrapper.request()); } catch (Exception ignored) {}
         SearchResult searchResult = RetrofitHelper.get(wrapper);
 
 
@@ -52,6 +56,7 @@ public class SearchService {
         }
 
         Call<SearchResultContinuation> wrapper = mSearchApi.continueSearchResult(SearchApiHelper.getContinuationQuery(nextSearchPageKey));
+        try { RetrofitOkHttpHelper.addAuthSkip(wrapper.request()); } catch (Exception ignored) {}
         SearchResultContinuation searchResult = RetrofitHelper.get(wrapper);
 
         if (searchResult == null) {
