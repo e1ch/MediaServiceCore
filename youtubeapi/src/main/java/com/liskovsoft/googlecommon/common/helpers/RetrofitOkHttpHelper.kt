@@ -87,6 +87,16 @@ internal object RetrofitOkHttpHelper {
                 if (visitorApiSuffixes.any { url.contains(it) })
                     headers["X-Goog-Visitor-Id"] ?: AppService.instance().visitorData?.let { requestBuilder.header("X-Goog-Visitor-Id", it) }
 
+                // Force localized titles (e.g. Disney+ in zh-TW instead of English)
+                if (headers["Accept-Language"] == null) {
+                    try {
+                        val lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().language
+                        if (lang != null && lang.isNotEmpty()) {
+                            requestBuilder.header("Accept-Language", "$lang,en-US;q=0.8,en;q=0.7")
+                        }
+                    } catch (_: Exception) {}
+                }
+
                 applyHeaders(this.apiHeaders, headers, requestBuilder)
 
                 val tParam = if (tParamSuffixes.any { url.contains(it) }) YouTubeHelper.generateTParameter() else null
