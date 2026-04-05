@@ -52,17 +52,13 @@ class YouTubeContentService implements ContentService {
     @Override
     public List<MediaGroup> getSearch(String searchText) {
         checkSigned();
-
-        SearchResult search = getSearchService().getSearch(searchText);
-        return YouTubeMediaGroup.from(search, MediaGroup.TYPE_SEARCH);
+        return getSearchService().getSearchFast(searchText, -1);
     }
 
     @Override
     public List<MediaGroup> getSearch(String searchText, int options) {
         checkSigned();
-
-        SearchResult search = getSearchService().getSearch(searchText, options);
-        return YouTubeMediaGroup.from(search, MediaGroup.TYPE_SEARCH);
+        return getSearchService().getSearchFast(searchText, options);
     }
 
     @Override
@@ -269,21 +265,25 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
-            // Phase 1: TV client recommendations (~1-3s)
-            kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
-
-            // Phase 2: unified "For You ✦" pool — Charts + kworb + search
-            // Emit BEFORE TV recommendations so it appears at top of home page
-            getBrowseService2().streamHomeExtra(group -> {
+            // Emit cached "For You ✦" FIRST (instant, before any network call)
+            getBrowseService2().emitCachedPool(group -> {
                 if (group != null && !group.isEmpty()) {
                     emitter.onNext(java.util.Collections.singletonList(group));
                 }
             });
 
-            // TV recommendations after "For You ✦"
+            // Phase 1: TV client recommendations (~1-3s)
+            kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
             if (fast != null && fast.getFirst() != null && !fast.getFirst().isEmpty()) {
                 emitter.onNext(fast.getFirst());
             }
+
+            // Phase 2: fresh "For You ✦" — Charts + kworb + search (replaces cache via ACTION_REPLACE)
+            getBrowseService2().streamHomeExtra(group -> {
+                if (group != null && !group.isEmpty()) {
+                    emitter.onNext(java.util.Collections.singletonList(group));
+                }
+            });
 
             emitter.onComplete();
         });

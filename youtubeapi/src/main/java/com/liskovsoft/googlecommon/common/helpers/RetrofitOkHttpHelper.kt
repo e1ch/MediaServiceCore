@@ -23,6 +23,13 @@ internal object RetrofitOkHttpHelper {
     @JvmStatic
     var disableCompression: Boolean = false
 
+    private val skipAuthThread = ThreadLocal<Boolean>()
+
+    @JvmStatic
+    fun setSkipAuthForCurrentThread(skip: Boolean) {
+        skipAuthThread.set(skip)
+    }
+
     @JvmStatic
     fun addAuthSkip(request: Request) {
         if (!authSkipList.contains(request))
@@ -81,7 +88,7 @@ internal object RetrofitOkHttpHelper {
             val url = request.url().toString()
 
             if (apiPrefixes.any { url.startsWith(it) }) {
-                val doSkipAuth = authSkipList.remove(request)
+                val doSkipAuth = authSkipList.remove(request) || skipAuthThread.get() == true
 
                 // Empty Home fix (anonymous user) and improve Recommendations for everyone
                 if (visitorApiSuffixes.any { url.contains(it) })
