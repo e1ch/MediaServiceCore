@@ -183,7 +183,9 @@ internal open class BrowseService2 {
                     // Jitter: 200-400ms random delay to spread requests
                     Thread.sleep(200L + random.nextInt(200))
                     val tq = System.currentTimeMillis()
-                    val sr = searchWithVisitorData(query)
+                    // Filter: THIS_MONTH — only show videos uploaded in the last 30 days
+                    val monthFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH
+                    val sr = searchWithVisitorData(query, monthFilter)
                     System.err.println("[PERF] search '$query' took ${System.currentTimeMillis() - tq}ms")
                     searchSemaphore.release()
 
@@ -286,8 +288,8 @@ internal open class BrowseService2 {
     fun getSearchFallbackParallel(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
         if (queries.isEmpty()) return emptyList()
 
-        // Use "This Year" upload date filter to avoid old clickbait
-        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_YEAR
+        // Use "This Month" upload date filter — only fresh content (last 30 days)
+        val dateFilter = com.liskovsoft.mediaserviceinterfaces.data.SearchOptions.UPLOAD_DATE_THIS_MONTH
 
         val result = mutableListOf<MediaGroup?>()
         val seenIds = mutableSetOf<String>()
