@@ -147,6 +147,21 @@ internal open class BrowseService2 {
      */
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         val level = getRefreshLevel()
+
+        // If cache is valid, emit it instantly (no network needed)
+        if (isPoolCacheValid() && cachedPoolJson != null) {
+            val cached = deserializePool(cachedPoolJson!!)
+            if (cached.size >= 3) {
+                val shuffled = cached.toMutableList().apply { shuffle(java.util.Random()) }
+                val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
+                group.title = discoveryTitle
+                group.mediaItems = java.util.ArrayList(shuffled)
+                onGroupReady.accept(group)
+                System.err.println("[PERF] pool cache hit: ${cached.size} items (age: ${(System.currentTimeMillis() - cachedPoolTimestamp)/1000}s)")
+                if (level == REFRESH_SOFT) return // cache is fresh enough
+            }
+        }
+
         if (level == REFRESH_SOFT) return
 
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -177,6 +192,9 @@ internal open class BrowseService2 {
                 group.title = discoveryTitle
                 group.mediaItems = java.util.ArrayList(shuffled)
                 onGroupReady.accept(group)
+                // Update cache for next app launch
+                cachedPoolJson = serializePool(pool.toList())
+                cachedPoolTimestamp = System.currentTimeMillis()
             }
         }
 
@@ -956,6 +974,59 @@ internal open class BrowseService2 {
         /** Last full refresh timestamp — used for refresh throttling */
         @JvmStatic @Volatile
         var lastFullRefreshMs: Long = 0
+
+        /** Persistent pool cache: survives app restart, avoids network on cold start */
+        @JvmStatic @Volatile
+        var cachedPoolJson: String? = null // serialized JSON, set/read by app layer
+
+        @JvmStatic @Volatile
+        var cachedPoolTimestamp: Long = 0 // when the cache was last updated
+
+        /** Cache TTL: 30 minutes. After this, background refresh replaces cache. */
+        const val POOL_CACHE_TTL_MS = 30 * 60 * 1000L
+
+        @JvmStatic
+        fun isPoolCacheValid(): Boolean {
+            return cachedPoolJson != null && (System.currentTimeMillis() - cachedPoolTimestamp) < POOL_CACHE_TTL_MS
+        }
+
+        /** Serialize pool items to JSON for local storage */
+        @JvmStatic
+        fun serializePool(items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>): String {
+            val arr = org.json.JSONArray()
+            for (item in items) {
+                val obj = org.json.JSONObject()
+                obj.put("videoId", item.videoId ?: "")
+                obj.put("title", item.title ?: "")
+                obj.put("author", item.author ?: "")
+                obj.put("cardImageUrl", item.cardImageUrl ?: "")
+                obj.put("secondTitle", item.secondTitle?.toString() ?: "")
+                obj.put("badgeText", item.badgeText ?: "")
+                arr.put(obj)
+            }
+            return arr.toString()
+        }
+
+        /** Deserialize pool from JSON */
+        @JvmStatic
+        fun deserializePool(json: String): List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem> {
+            val result = mutableListOf<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>()
+            try {
+                val arr = org.json.JSONArray(json)
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val item = com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem()
+                    item.videoId = obj.optString("videoId", "")
+                    item.title = obj.optString("title", "")
+                    item.author = obj.optString("author", "")
+                    item.cardImageUrl = obj.optString("cardImageUrl", "")
+                    item.secondTitle = obj.optString("secondTitle", "")
+                    item.badgeText = obj.optString("badgeText", "")
+                    if (item.videoId.isNotEmpty()) result.add(item)
+                }
+            } catch (_: Exception) {}
+            return result
+        }
 
         /**
          * Determines refresh level based on time since last full refresh.
