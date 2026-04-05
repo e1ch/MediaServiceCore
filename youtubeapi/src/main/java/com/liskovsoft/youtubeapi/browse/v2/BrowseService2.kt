@@ -190,16 +190,8 @@ internal open class BrowseService2 {
                 added++
             }
             System.err.println("[PERF] pool: +$added (seen=$skippedSeen excl=$skippedExcluded null=$skippedNull) total=${pool.size}")
-            if (pool.size >= 3) {
-                val shuffled = pool.toMutableList().apply { shuffle(random) }
-                val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
-                group.title = discoveryTitle
-                group.mediaItems = java.util.ArrayList(shuffled)
-                onGroupReady.accept(group)
-                // Update cache for next app launch
-                cachedPoolJson = serializePool(pool.toList())
-                cachedPoolTimestamp = System.currentTimeMillis()
-            }
+            // Don't emit here — collect all items first, emit once at the end
+            Unit
         }
 
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
@@ -256,6 +248,20 @@ internal open class BrowseService2 {
         }
 
         executor.shutdown()
+
+        // Final emit: one unified shuffled group with all collected items
+        if (pool.size >= 3) {
+            val shuffled = pool.toMutableList().apply { shuffle(random) }
+            val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
+            group.title = discoveryTitle
+            group.mediaItems = java.util.ArrayList(shuffled)
+            onGroupReady.accept(group)
+            // Save cache for next app launch
+            cachedPoolJson = serializePool(pool.toList())
+            cachedPoolTimestamp = System.currentTimeMillis()
+            System.err.println("[PERF] pool final emit: ${shuffled.size} items")
+        }
+
         lastFullRefreshMs = System.currentTimeMillis()
     }
 
