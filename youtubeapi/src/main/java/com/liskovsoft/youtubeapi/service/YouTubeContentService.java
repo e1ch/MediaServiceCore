@@ -269,19 +269,21 @@ class YouTubeContentService implements ContentService {
         return RxHelper.create(emitter -> {
             checkSigned();
 
-            // Phase 1: TV client recommendations (~1-3s) — shown instantly
+            // Phase 1: TV client recommendations (~1-3s)
             kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
 
-            if (fast != null && fast.getFirst() != null && !fast.getFirst().isEmpty()) {
-                emitter.onNext(fast.getFirst());
-            }
-
             // Phase 2: unified "For You ✦" pool — Charts + kworb + search
+            // Emit BEFORE TV recommendations so it appears at top of home page
             getBrowseService2().streamHomeExtra(group -> {
                 if (group != null && !group.isEmpty()) {
                     emitter.onNext(java.util.Collections.singletonList(group));
                 }
             });
+
+            // TV recommendations after "For You ✦"
+            if (fast != null && fast.getFirst() != null && !fast.getFirst().isEmpty()) {
+                emitter.onNext(fast.getFirst());
+            }
 
             emitter.onComplete();
         });

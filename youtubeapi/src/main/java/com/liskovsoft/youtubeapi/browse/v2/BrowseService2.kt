@@ -118,17 +118,17 @@ internal open class BrowseService2 {
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         val level = getRefreshLevel()
 
-        // If cache is valid and refresh is soft, emit cached pool and return (no network needed)
-        if (isPoolCacheValid() && cachedPoolJson != null) {
+        // Always emit cache first if available (guarantees "為你推薦 ✦" shows immediately)
+        if (cachedPoolJson != null) {
             val cached = deserializePool(cachedPoolJson!!)
-            if (cached.size >= MIN_POOL_SIZE && level == REFRESH_SOFT) {
+            if (cached.size >= MIN_POOL_SIZE) {
                 val shuffled = cached.toMutableList().apply { shuffle(java.util.Random()) }
                 val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
                 group.title = discoveryTitle
                 group.mediaItems = java.util.ArrayList(shuffled)
                 onGroupReady.accept(group)
-                Log.d(TAG, "[PERF] pool cache hit: ${cached.size} items (age: ${(System.currentTimeMillis() - cachedPoolTimestamp)/1000}s)")
-                return // cache is fresh enough
+                Log.d(TAG, "[PERF] pool cache emit: ${cached.size} items (age: ${(System.currentTimeMillis() - cachedPoolTimestamp)/1000}s)")
+                if (level == REFRESH_SOFT) return // SOFT: cache only, no network
             }
         }
 
@@ -147,60 +147,57 @@ internal open class BrowseService2 {
         }
         val searchSemaphore = java.util.concurrent.Semaphore(if (playbackActive) 1 else 2)
 
-        // Helper: add items to unified pool, dedup, emit shuffled snapshot
-        val addAndEmit = { items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
-            var added = 0; var skippedSeen = 0; var skippedExcluded = 0; var skippedNull = 0
+        val addToPool = { items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
+            var added = 0
             items?.forEach { item ->
-                val id = item.videoId
-                if (id == null) { skippedNull++; return@forEach }
-                if (!seenIds.add(id)) { skippedSeen++; return@forEach }
-                if (excluded.contains(id)) { skippedExcluded++; return@forEach }
+                val id = item.videoId ?: return@forEach
+                if (!seenIds.add(id)) return@forEach
+                if (excluded.contains(id)) return@forEach
                 pool.add(item)
                 shownVideoIds.add(id)
                 added++
             }
-            Log.d(TAG, "[PERF] pool: +$added (seen=$skippedSeen excl=$skippedExcluded null=$skippedNull) total=${pool.size}")
-            // Don't emit here — collect all items first, emit once at the end
+            Log.d(TAG, "[PERF] pool: +$added total=${pool.size}")
             Unit
         }
 
         val futures = mutableListOf<java.util.concurrent.Future<*>>()
 
-        // 1. YouTube Charts (fast)
+        // 1. YouTube Charts (fast) — fallback to kworb if Charts fails
         futures.add(executor.submit {
             try {
-                Log.d(TAG, "[PERF] Charts: starting...")
-                // Use separate seenIds for Charts internal dedup (don't pollute our pool's seenIds)
                 val chartSeenIds = mutableSetOf<String>()
                 fetchYouTubeCharts(MediaGroup.TYPE_HOME, chartSeenIds, excluded) { group ->
-                    Log.d(TAG, "[PERF] Charts group: ${group?.title} items=${group?.mediaItems?.size}")
-                    addAndEmit(group?.mediaItems)
+                    addToPool(group?.mediaItems)
                 }
             } catch (e: Exception) {
                 Log.d(TAG, "[PERF] Charts failed: ${e.message}")
-                try {
-                    val kworb = fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)
-                    addAndEmit(kworb?.mediaItems)
-                } catch (_: Exception) {}
+                try { addToPool(fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)?.mediaItems) }
+                catch (_: Exception) {}
             }
         })
 
-        // 2. Language discovery
+        // 2. kworb trending (runs in parallel with Charts — both contribute to pool)
+        futures.add(executor.submit {
+            try { addToPool(fetchKworbTrending(MediaGroup.TYPE_HOME, mutableSetOf(), excluded)?.mediaItems) }
+            catch (_: Exception) {}
+        })
+
+        // 3. Language discovery
         futures.add(executor.submit {
             try {
                 searchSemaphore.acquire()
                 val sr = searchFresh(getLanguageStopWord())
                 searchSemaphore.release()
-                val groups = YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)
-                addAndEmit(groups?.firstOrNull()?.mediaItems)
+                addToPool(YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)?.firstOrNull()?.mediaItems)
             } catch (_: Exception) { searchSemaphore.release() }
         })
 
-        // Wait for fast sources
+        // Wait for fast sources (Charts + kworb + language)
         for (f in futures) { try { f.get(15, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
 
-        // 3. Search queries (HARD only) — progressively grow the pool
-        if (level >= REFRESH_HARD) {
+        // 4. Search queries (MEDIUM + HARD) — grow pool with diverse content
+        if (level >= REFRESH_MEDIUM) {
             val queries = getRotatedHomeQueries()
             val searchFutures = queries.map { (_, query) ->
                 executor.submit {
@@ -209,8 +206,7 @@ internal open class BrowseService2 {
                         Thread.sleep(jitterMs.toLong() + random.nextInt(jitterMs))
                         val sr = searchFresh(query)
                         searchSemaphore.release()
-                        val groups = YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)
-                        addAndEmit(groups?.firstOrNull()?.mediaItems)
+                        addToPool(YouTubeMediaGroup.from(sr, MediaGroup.TYPE_HOME)?.firstOrNull()?.mediaItems)
                     } catch (_: Exception) { searchSemaphore.release() }
                 }
             }
@@ -219,17 +215,16 @@ internal open class BrowseService2 {
 
         executor.shutdown()
 
-        // Final emit: one unified shuffled group with all collected items
+        // Final emit: replace the cache-based emit with fresh content
         if (pool.size >= MIN_POOL_SIZE) {
             val shuffled = pool.toMutableList().apply { shuffle(random) }
             val group = YouTubeMediaGroup(MediaGroup.TYPE_HOME)
             group.title = discoveryTitle
             group.mediaItems = java.util.ArrayList(shuffled)
             onGroupReady.accept(group)
-            // Save cache for next app launch
             cachedPoolJson = serializePool(pool.toList())
             cachedPoolTimestamp = System.currentTimeMillis()
-            Log.d(TAG, "[PERF] pool final emit: ${shuffled.size} items")
+            Log.d(TAG, "[PERF] pool final emit: ${shuffled.size} items (Charts+kworb+search)")
         }
 
         lastFullRefreshMs = System.currentTimeMillis()
