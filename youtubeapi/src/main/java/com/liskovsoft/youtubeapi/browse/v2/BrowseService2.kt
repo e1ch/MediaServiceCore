@@ -72,6 +72,7 @@ internal open class BrowseService2 {
     fun getSearchFallback(queries: List<Pair<String, String>>, groupType: Int): List<MediaGroup?> {
         val result = mutableListOf<MediaGroup?>()
         val seenIds = mutableSetOf<String>()
+        val excluded = excludedVideoIds // snapshot for thread safety
         for ((title, query) in queries) {
             val searchResult = RetrofitHelper.get(
                 mSearchApi.getSearchResult(SearchApiHelper.getSearchQuery(query))
@@ -79,12 +80,11 @@ internal open class BrowseService2 {
             searchResult?.let {
                 val groups = YouTubeMediaGroup.from(it, groupType)
                 groups?.firstOrNull()?.let { group ->
-                    // Override the title with our category name
                     (group as? YouTubeMediaGroup)?.title = title
-                    // Deduplicate: remove videos already seen in previous queries
+                    // Remove: duplicates across queries + already watched videos
                     group.mediaItems?.removeAll { item ->
-                        val id = item?.videoId
-                        if (id != null && !seenIds.add(id)) true else false
+                        val id = item?.videoId ?: return@removeAll false
+                        !seenIds.add(id) || excluded.contains(id)
                     }
                     if (group.isEmpty != true) result.add(group)
                 }
@@ -105,6 +105,14 @@ internal open class BrowseService2 {
             "Viral" to "viral videos",
             "Popular Creators" to "popular youtube creators"
         )
+
+        /**
+         * Video IDs to exclude from search fallback results (e.g. already watched).
+         * Populated by the app layer (BrowsePresenter) before requesting home/trending.
+         * Thread-safe: replaced atomically, read during search fallback.
+         */
+        @JvmStatic @Volatile
+        var excludedVideoIds: Set<String> = emptySet()
     }
 
     fun getSports(): Pair<List<MediaGroup?>?, String?>? {
