@@ -272,33 +272,18 @@ class YouTubeContentService implements ContentService {
                 }
             });
 
-            // Run Phase 1 (TV default) and Phase 2 (discovery) in parallel.
-            // Collect results, emit discovery first then TV default.
-            final java.util.List<MediaGroup>[] tvGroups = new java.util.List[]{null};
-            final java.util.List<MediaGroup> discoveryGroups =
-                    java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+            // Phase 1: TV default (~2-3s) — emit immediately so user sees content fast
+            kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
+            if (fast != null && fast.getFirst() != null && !fast.getFirst().isEmpty()) {
+                emitter.onNext(fast.getFirst());
+            }
 
-            // Phase 1 in background thread
-            Thread tvThread = new Thread(() -> {
-                kotlin.Pair<List<MediaGroup>, String> fast = getBrowseService2().getHomeFast();
-                if (fast != null && fast.getFirst() != null) tvGroups[0] = fast.getFirst();
-            });
-            tvThread.start();
-
-            // Phase 2: discovery (Charts + kworb + search)
+            // Phase 2: discovery (Charts + kworb + search) — streams in after TV default
             getBrowseService2().streamHomeExtra(group -> {
                 if (group != null && !group.isEmpty()) {
-                    discoveryGroups.add(group);
-                    // Emit discovery shelves immediately (before TV default)
                     emitter.onNext(java.util.Collections.singletonList(group));
                 }
             });
-
-            // Wait for TV default to finish, then emit after discovery
-            try { tvThread.join(10_000); } catch (InterruptedException ignored) {}
-            if (tvGroups[0] != null && !tvGroups[0].isEmpty()) {
-                emitter.onNext(tvGroups[0]);
-            }
 
             emitter.onComplete();
         });

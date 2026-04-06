@@ -76,11 +76,19 @@ public class YouTubeMediaItemService implements MediaItemService {
             return cachedFormatInfo;
         }
 
+        long t0 = System.currentTimeMillis();
         checkSigned();
+        long t1 = System.currentTimeMillis();
 
         VideoInfo videoInfo = getVideoInfoService().getVideoInfo(videoId, clickTrackingParams);
+        long t2 = System.currentTimeMillis();
 
         MediaItemFormatInfo formatInfo = YouTubeMediaItemFormatInfo.from(videoInfo);
+        long t3 = System.currentTimeMillis();
+
+        android.util.Log.d("VideoLoadTiming", "getFormatInfo '" + videoId +
+                "': checkSigned=" + (t1-t0) + "ms, getVideoInfo(jsonpath)=" + (t2-t1) +
+                "ms, from=" + (t3-t2) + "ms, total=" + (t3-t0) + "ms");
 
         setCachedFormatInfo(formatInfo, clickTrackingParams);
 
