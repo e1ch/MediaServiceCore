@@ -198,14 +198,9 @@ internal open class BrowseService2 {
         }
     }
 
-    private var activeExecutor: java.util.concurrent.ExecutorService? = null
-
     fun streamHomeExtra(onGroupReady: java.util.function.Consumer<MediaGroup?>) {
         val level = getRefreshLevel()
         if (level == REFRESH_SOFT) return
-
-        // Shutdown previous executor to prevent stale results from old refresh
-        activeExecutor?.shutdownNow()
 
         val seenIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val excluded = excludedVideoIds
@@ -230,7 +225,6 @@ internal open class BrowseService2 {
         val executor = java.util.concurrent.Executors.newFixedThreadPool(maxConcurrent) { r ->
             Thread(r).apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
         }
-        activeExecutor = executor
         val searchSemaphore = java.util.concurrent.Semaphore(if (playbackActive) 1 else 2)
 
         val addToPool = { items: List<com.liskovsoft.mediaserviceinterfaces.data.MediaItem>? ->
