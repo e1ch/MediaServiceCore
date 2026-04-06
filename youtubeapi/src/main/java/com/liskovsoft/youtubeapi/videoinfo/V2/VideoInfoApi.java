@@ -18,6 +18,11 @@ public interface VideoInfoApi {
     @POST("https://www.youtube.com/youtubei/v1/player")
     Call<VideoInfo> getVideoInfo(@Body String videoQuery, @Header("x-goog-visitor-id") String visitorId, @Header("User-Agent") String userAgent);
 
+    /** Raw body version — bypasses JsonPath converter, for streaming parser */
+    @Headers("Content-Type: application/json")
+    @POST("https://www.youtube.com/youtubei/v1/player")
+    Call<okhttp3.ResponseBody> getVideoInfoRaw(@Body String videoQuery, @Header("x-goog-visitor-id") String visitorId, @Header("User-Agent") String userAgent);
+
     @Headers("Content-Type: application/json")
     @POST("https://youtubei.googleapis.com/youtubei/v1/reel/reel_item_watch")
     Call<VideoInfoReel> getVideoInfoReel(@Body String videoQuery, @Header("x-goog-visitor-id") String visitorId, @Header("User-Agent") String userAgent);

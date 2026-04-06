@@ -567,44 +567,6 @@ public class YouTubeMediaItemService implements MediaItemService {
         return VideoInfoService.instance();
     }
 
-    /**
-     * Fast path: raw HTTP + streaming JsonReader parser for /player endpoint.
-     * ~100ms parse vs 2-18s JsonPath on weak devices.
-     */
-    /**
-     * Fast path: raw HTTP with auth headers + streaming JsonReader parser.
-     * Uses RetrofitOkHttpHelper.client (same interceptor chain as Retrofit) so auth/PoToken work.
-     * But parses response with VideoInfoStreamingParser instead of JsonPath.
-     */
-    private com.liskovsoft.youtubeapi.videoinfo.models.VideoInfo getVideoInfoStreaming(String videoId) {
-        try {
-            String lang = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().getLanguage();
-            String region = com.liskovsoft.googlecommon.common.locale.LocaleManager.instance().getCountry();
-            String visitorData = com.liskovsoft.youtubeapi.app.AppService.instance().getVisitorData();
-            // Build same request body as VideoInfoApi but manually
-            String body = com.liskovsoft.youtubeapi.common.helpers.PostDataHelper.createQueryTV(
-                    "\"racyCheckOk\":true,\"contentCheckOk\":true,\"videoId\":\"" + videoId + "\"");
-
-            // Use Retrofit's client (has auth interceptor, adds OAuth, PoToken, etc.)
-            okhttp3.OkHttpClient client = com.liskovsoft.googlecommon.common.helpers.RetrofitOkHttpHelper.getClient();
-            okhttp3.Request.Builder rb = new okhttp3.Request.Builder()
-                    .url("https://www.youtube.com/youtubei/v1/player")
-                    .post(okhttp3.RequestBody.create(okhttp3.MediaType.parse("application/json"), body));
-            if (visitorData != null) rb.addHeader("X-Goog-Visitor-Id", visitorData);
-
-            okhttp3.Response response = client.newCall(rb.build()).execute();
-            if (!response.isSuccessful()) { response.close(); return null; }
-
-            com.liskovsoft.youtubeapi.videoinfo.models.VideoInfo result =
-                    com.liskovsoft.youtubeapi.videoinfo.models.VideoInfoStreamingParser.parse(response.body().byteStream());
-            response.close();
-            return result;
-        } catch (Exception e) {
-            android.util.Log.d("VideoLoadTiming", "streaming error: " + e.getMessage());
-            return null;
-        }
-    }
-
     @NonNull
     private static ActionsService getActionsService() {
         return ActionsServiceWrapper.instance();

@@ -201,11 +201,45 @@ public class VideoInfoService extends VideoInfoServiceBase {
             return getVideoInfoReel(wrapper, auth);
         }
 
+        // Try streaming parser first (100ms vs 2-18s JsonPath)
+        VideoInfo streamingResult = getVideoInfoStreaming(client, videoInfoQuery, auth);
+        if (streamingResult != null) {
+            return streamingResult;
+        }
+
+        // Fallback to JsonPath
         Call<VideoInfo> wrapper = mVideoInfoApi.getVideoInfo(videoInfoQuery, mAppService.getVisitorData(), client.getUserAgent());
-        return getVideoInfo(wrapper, auth);
+        return getVideoInfoJsonPath(wrapper, auth);
     }
 
-    private @Nullable VideoInfo getVideoInfo(Call<VideoInfo> wrapper, boolean auth) {
+    /** Fast path: streaming JsonReader parser, bypasses JsonPath converter */
+    private @Nullable VideoInfo getVideoInfoStreaming(AppClient client, String videoInfoQuery, boolean auth) {
+        try {
+            Call<okhttp3.ResponseBody> rawCall = mVideoInfoApi.getVideoInfoRaw(
+                    videoInfoQuery, mAppService.getVisitorData(), client.getUserAgent());
+            // Auth interceptor handles OAuth headers automatically via RetrofitOkHttpHelper
+            retrofit2.Response<okhttp3.ResponseBody> response = rawCall.execute();
+            if (!response.isSuccessful() || response.body() == null) return null;
+
+            VideoInfo videoInfo = com.liskovsoft.youtubeapi.videoinfo.models.VideoInfoStreamingParser.parse(
+                    response.body().byteStream());
+            response.body().close();
+
+            if (videoInfo == null || (videoInfo.getAdaptiveFormats() == null && videoInfo.getRegularFormats() == null)) {
+                Log.d(TAG, "Streaming parser: incomplete result, falling back to JsonPath");
+                return null;
+            }
+
+            videoInfo.setAuth(auth);
+            Log.d(TAG, "Streaming parser: OK, formats=" + videoInfo.getAdaptiveFormats().size());
+            return videoInfo;
+        } catch (Exception e) {
+            Log.d(TAG, "Streaming parser failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private @Nullable VideoInfo getVideoInfoJsonPath(Call<VideoInfo> wrapper, boolean auth) {
         VideoInfo videoInfo = RetrofitHelper.get(wrapper, auth);
 
         if (videoInfo == null) {
