@@ -99,26 +99,8 @@ private fun RichSectionRenderer.getContents() = content?.richShelfRenderer?.cont
 
 /////
 
-private const val TV_SHELVE_ROW_SIZE = 3 // the modern grid layout is actually rows with the same size
-
 internal fun ShelfListWrapper.getTitle(): String? = getFirstShelfRenderer()?.title?.getText()
-internal fun ShelfListWrapper.getItems(): List<ItemWrapper?>? =
-    // Remain only untitled rows. Helps to filter Subscriptions from "Most relevant" and "Shorts".
-    //getContents()?.flatMap { it?.takeIf { it.getTitle() == null }?.getItems() ?: emptyList() }
-    // The new approach: filter Subscriptions from 'Most relevant' by keeping the same size rows
-    // NOTE: new subscriptions use combined approach. No titles.
-    // grid for the long line of the recommendations, shelf for the content
-    // e.g. "contents" : [ { "gridRenderer": {...} }, { "shelfRenderer": {...}, { "shelfRenderer": {...} }
-    //getContents()?.flatMap { it?.getItems()?.takeIf { it.size == SHELVE_ROW_SIZE } ?: emptyList() }
-    // Another approach: filter by the last untitled row size
-    //getContents()?.let {
-    //    val size = it.lastOrNull { it != null && it.getTitle() == null }?.getItems()?.size
-    //    it.flatMap { it?.getItems()?.takeIf { size == null || it.size == size } ?: emptyList() }
-    //}
-    getContents()?.let {
-        val hasParts = it.any { it?.getItems()?.size == TV_SHELVE_ROW_SIZE }
-        it.flatMap { it?.getItems()?.takeIf { !hasParts || it.size == TV_SHELVE_ROW_SIZE } ?: emptyList() }
-    }
+internal fun ShelfListWrapper.getItems(): List<ItemWrapper?>? = getContents()?.getItems()
 internal fun ShelfListWrapper.getShortItems(): List<ItemWrapper?>? =
     getContents()?.firstNotNullOfOrNull { if (it?.containsShorts() == true) it.getItems() else null }
 internal fun ShelfListWrapper.getContinuationToken() = getContents()?.lastOrNull()?.getContinuationToken() ?: continuations?.getContinuationToken()
@@ -257,10 +239,47 @@ private const val SUBSCRIPTIONS_BROWSE_ID = "FEsubscriptions"
 
 internal fun BrowseResultTV.getShelves(): List<Shelf?>? = getContent()?.sectionListRenderer?.contents
     ?.filter { it?.shelfRenderer != null } // skip promoShelfRenderer
-    ?.sortedByDescending { it?.shelfRenderer?.endpoint?.getParams()?.let {
+    ?.let {
         // Move Live, Past Streams and Videos to the top
-        Helpers.startsWithAny(it,"EgZ2aWRlb3MYAyACOAJwA", "EgZ2aWRlb3MYAyAAcA", "EgZ2aWRlb3MYAyACOARwA")
-    } ?: false }
+        val (first, rest) = it.partition {
+            val params = it?.shelfRenderer?.endpoint?.getParams()
+            params != null && Helpers.startsWithAny(
+                params,
+                "EgZ2aWRlb3MYAyACOAJwA", // Live
+                "EgZ2aWRlb3MYAyAAcA", // Videos
+                "EgZ2aWRlb3MYAyACOARwA" // Past Streams
+            )
+        }
+
+        if (first.isEmpty()) return@let it // Home section detected or non-standard channel
+
+        // Move Shorts after (NOTE: Shorts doesn't contain endpoint)
+        val (shorts, other) = rest.partition {
+            it?.shelfRenderer?.containsShorts() == true
+        }
+
+        first + shorts + other
+    }
+    //?.sortedBy {
+    //    val params = it?.shelfRenderer?.endpoint?.getParams()
+    //
+    //    when {
+    //        // Move Live, Past Streams and Videos to the top
+    //        params != null && Helpers.startsWithAny(
+    //            params,
+    //            "EgZ2aWRlb3MYAyACOAJwA", // Live
+    //            "EgZ2aWRlb3MYAyAAcA", // Videos
+    //            "EgZ2aWRlb3MYAyACOARwA" // Past Streams
+    //        ) -> 0
+    //        // Move Shorts after (NOTE: Shorts doesn't contain endpoint)
+    //        params == null && it?.shelfRenderer?.containsShorts() == true -> 1
+    //        else -> 2 // Others
+    //    }
+    //}
+    //?.sortedByDescending { it?.shelfRenderer?.endpoint?.getParams()?.let {
+    //    // Move Live, Past Streams and Videos to the top
+    //    Helpers.startsWithAny(it,"EgZ2aWRlb3MYAyACOAJwA", "EgZ2aWRlb3MYAyAAcA", "EgZ2aWRlb3MYAyACOARwA")
+    //} ?: false }
 internal fun BrowseResultTV.getItems(): List<ItemWrapper?>? = getContent()?.gridRenderer?.items
     ?: getContent()?.twoColumnRenderer?.rightColumn?.playlistVideoListRenderer?.contents
     ?: getSubscriptionsTab()?.getItems() // see: getTVListRenderer()?.getItems() for how the actual filter from 'Most relevant' is happening
@@ -290,6 +309,19 @@ internal fun Shelf.getContinuationToken(): String? = shelfRenderer?.getContinuat
     ?: (gridRenderer ?: shelfRenderer?.content?.gridRenderer)?.getContinuationToken()
     ?: playlistVideoListRenderer?.getContinuationToken()
 internal fun Shelf.containsShorts(): Boolean = shelfRenderer?.containsShorts() == true
+
+////////////
+
+private const val TV_SHELVE_ROW_SIZE = 3 // the modern grid layout is actually rows with the same size
+
+// Filter Subscriptions/Channel uploads from "Most relevant" and "Shorts".
+// NOTE: new subscriptions use combined approach. No titles.
+// grid for the long line of the recommendations, shelf for the content
+// e.g. "contents" : [ { "gridRenderer": {...} }, { "shelfRenderer": {...}, { "shelfRenderer": {...} }
+internal fun List<Shelf?>.getItems(): List<ItemWrapper?> {
+    val hasParts = any { it?.getItems()?.size == TV_SHELVE_ROW_SIZE }
+    return flatMap { it?.getItems()?.takeIf { !hasParts || it.size == TV_SHELVE_ROW_SIZE } ?: emptyList() }
+}
 
 //////////
 
