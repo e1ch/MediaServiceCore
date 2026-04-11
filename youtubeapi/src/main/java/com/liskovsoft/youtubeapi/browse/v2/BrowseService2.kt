@@ -31,7 +31,12 @@ internal open class BrowseService2 {
             .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             .followRedirects(true)
         if (mainPool != null) builder.connectionPool(mainPool)
-        builder.build()
+        val client = builder.build()
+        // Initialize TrendingKeywordManager with the same anonymous client
+        if (!com.liskovsoft.youtubeapi.trending.TrendingKeywordManager.isInitialized()) {
+            com.liskovsoft.youtubeapi.trending.TrendingKeywordManager.init(client)
+        }
+        client
     }
 
     /**
@@ -348,6 +353,31 @@ internal open class BrowseService2 {
                 }
             }
             for (f in searchFutures) { try { f.get(20, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
+        }
+
+        // 5. Trending keywords from external sources (Google Trends, GDELT, Wikimedia)
+        if (level >= REFRESH_MEDIUM) {
+            val trendingQueries = com.liskovsoft.youtubeapi.trending.TrendingKeywordManager.getCachedAsQueryPairs()
+            if (trendingQueries.isNotEmpty()) {
+                Log.d(TAG, "[PERF] trending keywords: ${trendingQueries.size} queries")
+                val trendingExecutor = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+                    Thread(r).apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
+                }
+                val trendingFutures = trendingQueries.map { (title, query) ->
+                    trendingExecutor.submit {
+                        try {
+                            searchSemaphore.acquire()
+                            Thread.sleep(jitterMs.toLong() + random.nextInt(jitterMs))
+                            val items = searchFreshItems(query)
+                            searchSemaphore.release()
+                            Log.d(TAG, "[PERF] trending search '$query': ${items.size} items")
+                            if (unifiedShelf) { addToPool(items) } else { emitSeparate("$title \uD83D\uDD25", items) }
+                        } catch (e: Exception) { searchSemaphore.release() }
+                    }
+                }
+                for (f in trendingFutures) { try { f.get(20, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {} }
+                trendingExecutor.shutdown()
+            }
         }
 
         executor.shutdown()
@@ -1192,6 +1222,13 @@ internal open class BrowseService2 {
         /** Channel IDs already in prefetch — limits same-creator repetition */
         @JvmStatic
         val prefetchedChannelIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        /** Cached trending keywords JSON — persisted by app layer (SharedPreferences) */
+        @JvmStatic @Volatile
+        var trendingCacheJson: String? = null
+
+        @JvmStatic @Volatile
+        var trendingCacheTimestamp: Long = 0
 
         /** Video IDs already shown or prefetched — prevents duplicates across refreshes */
         @JvmStatic
