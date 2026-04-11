@@ -34,12 +34,21 @@ import okhttp3.OkHttpClient;
 public class TrendingKeywordManager {
     private static final String TAG = TrendingKeywordManager.class.getSimpleName();
 
+    // Individual source indices (internal)
     public static final int SOURCE_GOOGLE_TRENDS = 0;
     public static final int SOURCE_GDELT = 1;
     public static final int SOURCE_WIKIMEDIA = 2;
     public static final int SOURCE_TIKTOK = 3;
     public static final int SOURCE_REDDIT = 4;
     public static final int SOURCE_COUNT = 5;
+
+    // Pool indices (user-facing, maps to GeneralData bitmask)
+    // Pool F: Real-time News = Google Trends + GDELT → keywords → YouTube search
+    // Pool G: Social Trends = TikTok + Reddit → keywords → YouTube search
+    // Pool H: Cross-language = Wikimedia → keywords → YouTube search
+    public static final int POOL_F_REALTIME = 0;
+    public static final int POOL_G_SOCIAL = 1;
+    public static final int POOL_H_CROSSLANG = 2;
 
     private static volatile TrendingKeywordManager sInstance;
 
@@ -49,8 +58,11 @@ public class TrendingKeywordManager {
     // Cached keywords — thread-safe, replaced atomically per source
     private static volatile List<TrendingKeyword> sCachedKeywords = new CopyOnWriteArrayList<>();
 
-    // Source enable bitmask — set by app layer from GeneralData
-    private static volatile int sEnabledSources = 0x1F; // all 5 enabled by default
+    // Pool enable bitmask — set by app layer from GeneralData
+    // bit0 = Pool F (realtime: Google Trends + GDELT)
+    // bit1 = Pool G (social: TikTok + Reddit)
+    // bit2 = Pool H (cross-lang: Wikimedia)
+    private static volatile int sEnabledPools = 0x7; // all 3 pools enabled by default
 
     // Serialized cache for persistence across restarts
     private static volatile String sCachedJson = null;
@@ -97,27 +109,35 @@ public class TrendingKeywordManager {
     }
 
     /**
-     * Enable/disable a trending source by index.
-     * Called from GeneralData preference system.
+     * Set pool enable bitmask from GeneralData.
+     * Pool F (bit 0) = Google Trends + GDELT
+     * Pool G (bit 1) = TikTok + Reddit
+     * Pool H (bit 2) = Wikimedia
      */
-    public static void setSourceEnabled(int index, boolean enabled) {
-        if (enabled) {
-            sEnabledSources |= (1 << index);
-        } else {
-            sEnabledSources &= ~(1 << index);
+    public static void setEnabledPoolsMask(int mask) {
+        sEnabledPools = mask;
+    }
+
+    public static int getEnabledPoolsMask() {
+        return sEnabledPools;
+    }
+
+    /**
+     * Check if a specific source should be fetched based on its parent pool.
+     */
+    public static boolean isSourceEnabled(int sourceIndex) {
+        switch (sourceIndex) {
+            case SOURCE_GOOGLE_TRENDS:
+            case SOURCE_GDELT:
+                return (sEnabledPools & (1 << POOL_F_REALTIME)) != 0;
+            case SOURCE_TIKTOK:
+            case SOURCE_REDDIT:
+                return (sEnabledPools & (1 << POOL_G_SOCIAL)) != 0;
+            case SOURCE_WIKIMEDIA:
+                return (sEnabledPools & (1 << POOL_H_CROSSLANG)) != 0;
+            default:
+                return false;
         }
-    }
-
-    public static boolean isSourceEnabled(int index) {
-        return (sEnabledSources & (1 << index)) != 0;
-    }
-
-    public static void setEnabledSourcesMask(int mask) {
-        sEnabledSources = mask;
-    }
-
-    public static int getEnabledSourcesMask() {
-        return sEnabledSources;
     }
 
     /**
