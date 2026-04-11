@@ -37,7 +37,9 @@ public class TrendingKeywordManager {
     public static final int SOURCE_GOOGLE_TRENDS = 0;
     public static final int SOURCE_GDELT = 1;
     public static final int SOURCE_WIKIMEDIA = 2;
-    public static final int SOURCE_COUNT = 3;
+    public static final int SOURCE_TIKTOK = 3;
+    public static final int SOURCE_REDDIT = 4;
+    public static final int SOURCE_COUNT = 5;
 
     private static volatile TrendingKeywordManager sInstance;
 
@@ -48,7 +50,7 @@ public class TrendingKeywordManager {
     private static volatile List<TrendingKeyword> sCachedKeywords = new CopyOnWriteArrayList<>();
 
     // Source enable bitmask — set by app layer from GeneralData
-    private static volatile int sEnabledSources = 0x7; // all enabled by default
+    private static volatile int sEnabledSources = 0x1F; // all 5 enabled by default
 
     // Serialized cache for persistence across restarts
     private static volatile String sCachedJson = null;
@@ -60,6 +62,8 @@ public class TrendingKeywordManager {
         mFetchers.add(new GoogleTrendsFetcher(httpClient));
         mFetchers.add(new GdeltFetcher(httpClient));
         mFetchers.add(new WikimediaMostReadFetcher(httpClient));
+        mFetchers.add(new TikTokTrendsFetcher(httpClient));
+        mFetchers.add(new RedditTrendsFetcher(httpClient));
 
         mLastFetchTimes = new ArrayList<>();
         for (int i = 0; i < SOURCE_COUNT; i++) {
@@ -248,6 +252,8 @@ public class TrendingKeywordManager {
             case "GoogleTrends": return SOURCE_GOOGLE_TRENDS;
             case "GDELT": return SOURCE_GDELT;
             case "Wikimedia": return SOURCE_WIKIMEDIA;
+            case "TikTok": return SOURCE_TIKTOK;
+            case "Reddit": return SOURCE_REDDIT;
             default: return -1;
         }
     }
